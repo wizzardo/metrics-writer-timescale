@@ -1,0 +1,63 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        maven {
+            url "https://oss.sonatype.org/content/repositories/snapshots/"
+        }
+        maven {
+            url "https://plugins.gradle.org/m2/"
+        }
+    }
+    dependencies {
+        classpath 'com.wizzardo.tools:tools-gradle-build:0.24-SNAPSHOT'
+    }
+}
+
+apply plugin: 'java'
+apply plugin: 'application'
+apply plugin: 'tools-gradle-build'
+
+sourceCompatibility = 21
+
+mainClassName = "com.wizzardo.metrics.timescale.App"
+
+group = 'com.wizzardo'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+    maven {
+        url "https://oss.sonatype.org/content/repositories/snapshots/"
+    }
+}
+
+dependencies {
+    implementation 'com.wizzardo:http:0.5-SNAPSHOT'
+    implementation 'com.wizzardo:datadog-jvm:0.4+'
+    implementation 'com.wizzardo:epoll:0.3.5-SNAPSHOT'
+
+
+    implementation "org.postgresql:postgresql:42.7.3"
+
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+
+sqlTools {
+    migrations {
+        enabled = true
+        src = 'migrations'
+        out = 'migrations.txt'
+    }
+    tablesGenerator {
+        enabled = true
+        src = 'src/main/java/com/wizzardo/metrics/timescale/db/model'
+        out = 'src/main/java/com/wizzardo/metrics/timescale/db/generated'
+        packageName = 'com.wizzardo.metrics.timescale.db.generated'
+    }
+}
