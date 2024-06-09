@@ -11,6 +11,7 @@ import com.wizzardo.metrics.timescale.db.model.Metric;
 import com.wizzardo.metrics.timescale.model.MetricData;
 import com.wizzardo.metrics.timescale.service.DBService;
 import com.wizzardo.tools.cache.Cache;
+import com.wizzardo.tools.interfaces.Mapper;
 import com.wizzardo.tools.json.JsonTools;
 import com.wizzardo.tools.misc.Pair;
 import com.wizzardo.tools.misc.With;
@@ -57,6 +58,17 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         public String hypertable_name;
     }
 
+    public static class RetentionJob {
+        public int job_id;
+        public String hypertable_schema;
+        public String hypertable_name;
+        public RetentionConfig config;
+    }
+
+    public static class RetentionConfig {
+        public String drop_after;
+    }
+
     public static class Column {
         public String column_name;
         public String data_type;
@@ -67,12 +79,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
     public void init() {
         dbService.withBuilder(b -> {
 //            SELECT *  FROM pg_catalog.pg_tables WHERE schemaname = 'metrics' ;
-            Table pg_tables = new Table("pg_catalog.pg_tables") {
-                @Override
-                public List<Field> getFields() {
-                    return List.of();
-                }
-            };
+            Table pg_tables = new SimpleTable("pg_catalog.pg_tables");
             List<PgTable> tables = b.select(new Field(pg_tables, "tablename"))
                     .from(pg_tables)
                     .where(new Field.StringField(pg_tables, "schemaname").eq(schema))
@@ -85,18 +92,11 @@ public class IngestHandler extends RestHandler implements PostConstruct {
 
                 System.out.println(table.tablename);
 
-                Table metricTable = new Table(schema + "." + table.tablename) {
-                    List<Field> fields = Arrays.asList(
-                            new Field.DateField(this, "created_at"),
-                            new Field.IntField(this, "tags_id"),
-                            new Field.DoubleField(this, "value")
-                    );
-
-                    @Override
-                    public List<Field> getFields() {
-                        return fields;
-                    }
-                };
+                Table metricTable = new SimpleTable(schema + "." + table.tablename, t -> Arrays.asList(
+                        new Field.DateField(t, "created_at"),
+                        new Field.IntField(t, "tags_id"),
+                        new Field.DoubleField(t, "value")
+                ));
 
 //                SELECT * FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'metric';
                 String tagsTableName = "_tags_" + table.tablename;
@@ -108,18 +108,14 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             }
 
             enableCompression(b);
+            enableRetention(b);
 
             return null;
         });
     }
 
     private void enableCompression(QueryBuilder.WrapConnectionStep b) throws SQLException {
-        Table hypertablesTable = new Table("timescaledb_information.hypertables") {
-            @Override
-            public List<Field> getFields() {
-                return List.of();
-            }
-        };
+        Table hypertablesTable = new SimpleTable("timescaledb_information.hypertables");
         List<HyperTable> tables = b.select(
                         new Field(hypertablesTable, "hypertable_schema"),
                         new Field(hypertablesTable, "hypertable_name")
@@ -153,13 +149,59 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         c.createStatement().execute(sql);
     }
 
-    private Table getTagsTable(QueryBuilder.WrapConnectionStep b, String schema, String tagsTableName) throws SQLException {
-        Table columnsTable = new Table("information_schema.columns") {
-            @Override
-            public List<Field> getFields() {
-                return List.of();
+    private void enableRetention(QueryBuilder.WrapConnectionStep b) throws SQLException {
+        Table hypertablesTable = new SimpleTable("timescaledb_information.hypertables");
+        List<HyperTable> tables = b.select(
+                        new Field(hypertablesTable, "hypertable_schema"),
+                        new Field(hypertablesTable, "hypertable_name")
+                )
+                .from(hypertablesTable)
+                .fetchInto(HyperTable.class);
+
+        Table jobsTable = new SimpleTable("timescaledb_information.jobs");
+
+        List<RetentionJob> retentionJobs = b.select(
+                        new Field(jobsTable, "job_id"),
+                        new Field(jobsTable, "hypertable_schema"),
+                        new Field(jobsTable, "hypertable_name"),
+                        new Field(jobsTable, "config")
+                )
+                .from(jobsTable)
+                .where(new Field.StringField(jobsTable, "proc_name").eq("policy_retention"))
+                .fetchInto(RetentionJob.class);
+
+        Map<Pair<String, String>, RetentionConfig> policies = new HashMap<>(tables.size());
+        for (RetentionJob retentionJob : retentionJobs) {
+            policies.put(Pair.of(retentionJob.hypertable_schema, retentionJob.hypertable_name), retentionJob.config);
+        }
+
+        String retention = "14 days";
+
+        for (HyperTable table : tables) {
+            RetentionConfig existingPolicy = policies.get(Pair.of(table.hypertable_schema, table.hypertable_name));
+            System.out.println("retention config for " + table.hypertable_schema + "." + table.hypertable_name + ": " + (existingPolicy != null ? existingPolicy.drop_after : null));
+            if (existingPolicy != null && retention.equals(existingPolicy.drop_after)) {
+                continue;
             }
-        };
+
+            dbService.withDBTransaction(c -> {
+                if (existingPolicy != null) {
+                    String sql = "SELECT remove_retention_policy('" + table.hypertable_schema + "." + table.hypertable_name + "');";
+                    System.out.println(sql);
+                    c.createStatement().execute(sql);
+                }
+
+                String sql = "SELECT add_retention_policy('" + table.hypertable_schema + "." + table.hypertable_name + "', drop_after => INTERVAL '" + retention + "');";
+                System.out.println(sql);
+                c.createStatement().execute(sql);
+                return Void.TYPE;
+            });
+
+        }
+    }
+
+    private Table getTagsTable(QueryBuilder.WrapConnectionStep b, String schema, String tagsTableName) throws SQLException {
+        Table columnsTable = new SimpleTable("information_schema.columns");
         List<Column> columns = b.select(
                         new Field(columnsTable, "column_name"),
                         new Field(columnsTable, "data_type"),
@@ -172,22 +214,15 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                 .fetchInto(Column.class);
 
 
-        Table metricTagsTable = new Table(schema + "." + tagsTableName) {
-            final List<Field> fields = With.map(new ArrayList<Field>(columns.size() + 1), it -> {
-                for (Column column : columns) {
-                    switch (column.udt_name) {
-                        case "int4" -> it.add(new Field.IntField(this, column.column_name));
-                        case "text" -> it.add(new Field.StringField(this, "\"" + column.column_name + "\""));
-                    }
+        Table metricTagsTable = new SimpleTable(schema + "." + tagsTableName, table -> With.map(new ArrayList<Field>(columns.size() + 1), it -> {
+            for (Column column : columns) {
+                switch (column.udt_name) {
+                    case "int4" -> it.add(new Field.IntField(table, column.column_name));
+                    case "text" -> it.add(new Field.StringField(table, "\"" + column.column_name + "\""));
                 }
-                return it;
-            });
-
-            @Override
-            public List<Field> getFields() {
-                return fields;
             }
-        };
+            return it;
+        }));
 
         for (Column column : columns) {
             System.out.println("\t" + column.column_name + ": " + column.udt_name);
@@ -286,25 +321,6 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         return response.setStatus(Status._200).body("");
     }
 
-//    void insert(MetricData metricData) {
-//        dbService.withBuilder(db -> {
-//            Metric metric = new Metric();
-//            metric.value = metricData.value;
-//            if (metricData.timestamp != 0)
-//                metric.createdAt = new Timestamp(metricData.timestamp / 1000_000);
-//            else
-//                metric.createdAt = new Timestamp(System.currentTimeMillis());
-//
-//            metric.createdAt.setNanos((int) (metricData.timestamp % 1000_000));
-//
-//            List<List<String>> tags = metricData.tags;
-//            Pair<Table, Table> tables = tablesCache.get(toTableName(metricData.name), tableName -> createMetricTable(tableName, tags));
-//            metric.tagsId = getTags(metricData, tables);
-//            db.insertInto(tables.key).values(metric).executeInsert();
-//            return Void.TYPE;
-//        });
-//    }
-
     void insert(String tableName, List<Metric> metrics) {
         try {
             metrics.sort(Comparator.comparing(metric -> metric.createdAt));
@@ -368,19 +384,11 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                 statement.execute();
 
 
-                Table metricTable = new Table(schema + "." + tableName) {
-
-                    List<Field> fields = Arrays.asList(
-                            new Field.DateField(this, "created_at"),
-                            new Field.IntField(this, "tags_id"),
-                            new Field.DoubleField(this, "value")
-                    );
-
-                    @Override
-                    public List<Field> getFields() {
-                        return fields;
-                    }
-                };
+                Table metricTable = new SimpleTable(schema + "." + tableName, table -> Arrays.asList(
+                        new Field.DateField(table, "created_at"),
+                        new Field.IntField(table, "tags_id"),
+                        new Field.DoubleField(table, "value")
+                ));
 
                 Table metricTagsTable = getTagsTable(QueryBuilder.withConnection(c), schema, tagsTableName);
 
@@ -529,70 +537,22 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         return (i == 1 && field.getName().length() == columnName.length() + 2) || (i == 0 && field.getName().length() == columnName.length());
     }
 
-//    Integer getTags(MetricData metricData) {
-//        metricData.tags.sort(Comparator.comparing(o -> o.get(0)));
-//        TagsCacheKey key = new TagsCacheKey(metricData.name, metricData.tags);
-//
-//        return tagsCache.get(key, s ->
-//                        dbService.withBuilder(db -> {
-//                            Map<Object, Object> map = new LinkedHashMap<>(metricData.tags.size() + 2);
-//                            map.put("metric_name", metricData.name);
-//                            for (int i = 0; i < metricData.tags.size(); i++) {
-//                                List<String> kv = metricData.tags.get(i);
-//                                map.put(kv.get(0), kv.get(1));
-//                            }
-////                          String tagset = JsonTools.serialize(map);
-//                            System.out.println("trying to insert tagset " + map);
-//
-//                            Tags tags = new Tags();
-//                            tags.tagset = map;
-//                            tags.id = db.insertInto(Tables.TAGS)
-//                                    .values(tags)
-//                                    .onConflictDoUpdate(Tables.TAGS.TAGSET)
-//                                    .set(Tables.TAGS.ID.eq(Tables.TAGS.ID))
-//                                    .returning(Tables.TAGS.ID)
-//                                    .fetchOneInto(TagIdHolder.class).id;
-//                            return tags.id;
-//                        })
-//        );
-//    }
+    static class SimpleTable extends Table {
+        protected List<Field> fields;
 
-//    MetricName getMetricName(String name) {
-//        return metricNameCache.get(name, s ->
-//                dbService.transaction(db -> {
-//                    MetricName metricName = db.select()
-//                            .from(Tables.METRIC_NAME)
-//                            .where(Tables.METRIC_NAME.NAME.eq(name))
-//                            .limit(1)
-//                            .fetchOneInto(MetricName.class);
-//
-//                    if (metricName == null) {
-//                        metricName = new MetricName();
-//                        metricName.name = name;
-//                        metricName.id = dbService.insertInto(db, metricName, Tables.METRIC_NAME);
-//                    }
-//                    return metricName;
-//                })
-//        );
-//    }
-//
-//    Tag getTag(String name, String value) {
-//        return tagCache.get(Pair.of(name, value), p ->
-//                dbService.transaction(db -> {
-//                    Tag tag = db.select()
-//                            .from(Tables.TAG)
-//                            .where(Tables.TAG.NAME.eq(name).and(Tables.TAG.VALUE.eq(value)))
-//                            .limit(1)
-//                            .fetchOneInto(Tag.class);
-//
-//                    if (tag == null) {
-//                        tag = new Tag();
-//                        tag.name = name;
-//                        tag.value = value;
-//                        tag.id = dbService.insertInto(db, tag, Tables.TAG);
-//                    }
-//                    return tag;
-//                })
-//        );
-//    }
+        public SimpleTable(String name) {
+            super(name);
+            fields = Collections.emptyList();
+        }
+
+        public SimpleTable(String name, Mapper<Table, List<Field>> fieldCreator) {
+            super(name);
+            this.fields = fieldCreator.map(this);
+        }
+
+        @Override
+        public List<Field> getFields() {
+            return fields;
+        }
+    }
 }
