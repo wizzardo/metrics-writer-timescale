@@ -40,9 +40,8 @@ public class IngestHandler extends RestHandler implements PostConstruct {
     }
 
     Cache<TagsCacheKey, Integer> tagsCache = new Cache<>(3600);
+    Cache<String, String> stringCache = new Cache<>(-1, s -> s);
     Cache<String, Pair<Table, Table>> tablesCache = new Cache<>(-1);
-//    Cache<Pair<String,String>, Tag> tagCache = new Cache<>(-1);
-//    Cache<Pair<String,String>, Tag> tagCache = new Cache<>(-1);
 
     public IngestHandler() {
         super(IngestHandler.class.getSimpleName());
@@ -430,6 +429,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
     }
 
     GetTagsResult getTags(MetricData metricData, Pair<Table, Table> metricTables) {
+        internStrings(metricData.tags);
         metricData.tags.sort(Comparator.comparing(List::getFirst));
         TagsCacheKey key = new TagsCacheKey(metricTables.key.getName(), metricData.tags);
         GetTagsResult result = new GetTagsResult();
@@ -492,6 +492,14 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                         })
         );
         return result;
+    }
+
+    private void internStrings(List<List<String>> tags) {
+        for (int i = 0; i < tags.size(); i++) {
+            List<String> kv = tags.get(i);
+            kv.set(0, stringCache.get(kv.get(0)));
+            kv.set(1, stringCache.get(kv.get(1)));
+        }
     }
 
     private Table updateColumns(Pair<Table, Table> metricTables, List<List<String>> tags) {
