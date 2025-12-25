@@ -7,7 +7,11 @@ import com.wizzardo.http.framework.di.PostConstruct;
 import com.wizzardo.http.request.Request;
 import com.wizzardo.http.response.Response;
 import com.wizzardo.http.response.Status;
+import com.wizzardo.metrics.timescale.db.generated.Tables;
+import com.wizzardo.metrics.timescale.db.generated.TagTable;
 import com.wizzardo.metrics.timescale.db.model.Metric;
+import com.wizzardo.metrics.timescale.db.model.Tag;
+import com.wizzardo.metrics.timescale.misc.InsertFieldsStep;
 import com.wizzardo.metrics.timescale.model.MetricData;
 import com.wizzardo.metrics.timescale.service.DBService;
 import com.wizzardo.tools.cache.Cache;
@@ -40,6 +44,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
     }
 
     Cache<TagsCacheKey, Integer> tagsCache = new Cache<>(3600);
+    Cache<String, Integer> tagCache = new Cache<>(3600);
     Cache<String, String> stringCache = new Cache<>(-1, s -> s);
     Cache<String, Pair<Table, Table>> tablesCache = new Cache<>(-1);
 
@@ -74,6 +79,10 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         public String udt_name;
     }
 
+    public static class IntIdHolder {
+        public int id;
+    }
+
     @Override
     public void init() {
         dbService.withBuilder(b -> {
@@ -87,6 +96,8 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             System.out.println("tables:");
             for (PgTable table : tables) {
                 if (table.tablename.startsWith("_tags_"))
+                    continue;
+                if (table.tablename.startsWith("_tag"))
                     continue;
 
                 System.out.println(table.tablename);
@@ -248,17 +259,30 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         StringBuilder sb = new StringBuilder()
                 .append("create view ").append(tableName).append(" as SELECT")
                 .append(" m.value,")
-                .append(" m.created_at,");
+                .append(" m.created_at");
 
         List<Field> fields = tagsTable.getFields();
         for (int i = 0; i < fields.size(); i++) {
             Field f = fields.get(i);
-            if (i > 0)
-                sb.append(",");
-            sb.append(" tags.").append(f.getName());
+            if(f.getName().equals("id"))
+                continue;
+
+            sb.append(", ");
+//            sb.append(" tags.").append(f.getName());
+            sb.append("\"").append(f.getName()).append("\".name as \"").append(f.getName()).append("\"");
         }
         sb.append(" FROM ").append(schema).append(".").append(tableName).append(" m");
         sb.append(" join ").append(schema).append("._tags_").append(tableName).append(" tags on m.tags_id=tags.id");
+
+        for (int i = 0; i < fields.size(); i++) {
+            Field f = fields.get(i);
+            if(f.getName().equals("id"))
+                continue;
+            String tag = f.getName();
+            sb.append(" left join ").append(schema).append("._tag ")
+                    .append("\"").append(tag).append("\" on tags.").append(tag)
+                    .append(" = \"").append(tag).append("\".id");
+        }
 
         System.out.println(sb);
 
@@ -359,15 +383,16 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                 statement.execute();
 
                 String tagsTableName = "_tags_" + tableName;
+                String tagsTableNameWithSchema = schema+"._tags_" + tableName;
                 StringBuilder sb = new StringBuilder()
-                        .append("create table " + schema + ".").append(tagsTableName).append(" (\n")
+                        .append("create table ").append(tagsTableNameWithSchema).append(" (\n")
                         .append("id SERIAL PRIMARY KEY,\n");
 
                 for (int i = 0; i < initialTags.size(); i++) {
                     List<String> tag = initialTags.get(i);
                     if (i > 0)
                         sb.append(",\n");
-                    sb.append('"').append(toColumnName(tag.get(0))).append("\" text");
+                    sb.append('"').append(toColumnName(tag.get(0))).append("\" int");
                 }
                 sb.append(")");
 
@@ -382,6 +407,16 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                 statement = c.prepareStatement("SELECT create_hypertable('" + schema + "." + tableName + "', by_range('created_at'))");
                 statement.execute();
 
+
+                for (int i = 0; i < initialTags.size(); i++) {
+                    List<String> tag = initialTags.get(i);
+                    String columnName = toColumnName(tag.get(0));
+
+                    String sql = "create index " + tagsTableName + "__" + columnName + " on " + tagsTableNameWithSchema + "(\"" + columnName + "\")";
+                    System.out.println(sql);
+                    statement = c.prepareStatement(sql);
+                    statement.execute();
+                }
 
                 Table metricTable = new SimpleTable(schema + "." + tableName, table -> Arrays.asList(
                         new Field.DateField(table, "created_at"),
@@ -455,7 +490,9 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                                         break;
                                     }
                                 }
-                                condition = condition.and(((Field.StringField) field).eq(value));
+
+                                Integer tagId = getTagId(db, value);
+                                condition = condition.and(((Field.IntField) field).eq(tagId));
                             }
 
 
@@ -468,21 +505,23 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                             if (idHolder == null) {
                                 List<Field> tagsColumns = fields.subList(1, fields.size());
                                 QueryBuilder.InsertValuesStep query = new QueryBuilder.InsertValuesStep(
-                                        db.insertInto(tagsTable).fields(tagsColumns),
+//                                        db.insertInto(tagsTable).fields(tagsColumns),
+                                        new InsertFieldsStep(db.insertInto(tagsTable), tagsColumns),
                                         metricData.tags,
                                         tagsColumns.stream().map(field -> (Field.ToSqlMapper) (o, builder) -> {
                                             for (int j = 0; j < metricData.tags.size(); j++) {
                                                 List<String> kv = metricData.tags.get(j);
                                                 if (isColumnMatchingTag(field, toColumnName(kv.get(0)))) {
-                                                    builder.setField(kv.get(1));
+                                                    Integer tagId = getTagId(db, kv.get(1));
+                                                    builder.setField(tagId);
                                                     return;
                                                 }
                                             }
-                                            builder.setField((String) null);
+                                            builder.setField((Integer) null);
                                         }).toList()
                                 );
 
-//                        System.out.println(query.toSql());
+//                                System.out.println(query.toSql());
 
                                 int id = (int) query.executeInsert(fields.get(0));
                                 result.created = true;
@@ -492,6 +531,24 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                         })
         );
         return result;
+    }
+
+    private Integer getTagId(QueryBuilder.WrapConnectionStep db, String value) {
+        if (value == null) {
+            return null;
+        }
+        return tagCache.get(value, name -> {
+            TagTable tag = new TagTable("metrics._tag", null);
+            QueryBuilder.ReturningStep query = db.insertInto(tag)
+                    .values(With.with(new Tag(), it -> it.name = name))
+                    .onConflictDoUpdate(tag.NAME)
+                    .set(tag.NAME.eq(name))
+                    .returning(tag.ID);
+//            System.out.println(query.toSql());
+            return query
+                    .fetchOneInto(IntIdHolder.class).id;
+//                                    return db.select(tagTable.FIELDS).from(tagTable).where(tagTable.NAME.eq(name)).fetchOneInto(Tag.class).id;
+        });
     }
 
     private void internStrings(List<List<String>> tags) {
@@ -509,16 +566,25 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             Table metricTagsTable;
             System.out.println("updateColumns to match tags: " + tags);
             String tableName = metricTables.key.getName().split("\\.")[1];
+            String tagsTableName = metricTables.value.getName().split("\\.")[1];
             try {
                 for (List<String> kv : tags) {
                     String columnName = toColumnName(kv.get(0));
                     if (tagsTable.getFields().stream().anyMatch(field -> isColumnMatchingTag(field, columnName)))
                         continue;
 
-                    String sql = "alter table " + tagsTable.getName() + " add column \"" + columnName + "\" text";
-                    System.out.println(sql);
-                    PreparedStatement statement = c.prepareStatement(sql);
-                    statement.execute();
+                    {
+                        String sql = "alter table " + tagsTable.getName() + " add column \"" + columnName + "\" int";
+                        System.out.println(sql);
+                        PreparedStatement statement = c.prepareStatement(sql);
+                        statement.execute();
+                    }
+                    {
+                        String sql = "create index " + tagsTableName + "__" + columnName + " on " + tagsTable.getName() + "(\"" + columnName + "\")";
+                        System.out.println(sql);
+                        PreparedStatement statement = c.prepareStatement(sql);
+                        statement.execute();
+                    }
                 }
 
                 metricTagsTable = getTagsTable(QueryBuilder.withConnection(c), schema, tagsTable.getName().split("\\.")[1]);

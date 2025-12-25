@@ -2,6 +2,7 @@
 .idea
 build
 .data
+out
 
 src/main/java/com/wizzardo/metrics/timescale/db/generated
 src/main/resources/migrations.txt

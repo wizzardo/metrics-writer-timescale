@@ -11,4 +11,4 @@ docker run --rm \
   -e POSTGRES_USER=metrics-rw \
   -e POSTGRES_PASSWORD=qwerty \
   -v $DATA_PATH:/var/lib/postgresql/data \
-  timescale/timescaledb:latest-pg16
+  timescale/timescaledb:latest-pg18

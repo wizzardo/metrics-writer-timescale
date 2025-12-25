@@ -2,7 +2,8 @@ buildscript {
     repositories {
         mavenCentral()
         maven {
-            url "https://oss.sonatype.org/content/repositories/snapshots/"
+//            url "https://oss.sonatype.org/content/repositories/snapshots/"
+            url = "https://central.sonatype.com/repository/maven-snapshots/"
         }
         maven {
             url "https://plugins.gradle.org/m2/"
@@ -27,15 +28,24 @@ version = '1.0-SNAPSHOT'
 repositories {
     mavenCentral()
     maven {
-        url "https://oss.sonatype.org/content/repositories/snapshots/"
+//        url "https://oss.sonatype.org/content/repositories/snapshots/"
+        url = "https://central.sonatype.com/repository/maven-snapshots/"
     }
+    maven { url 'https://jitpack.io' }
 }
 
 dependencies {
-    implementation 'com.wizzardo:http:0.5-SNAPSHOT'
-    implementation 'com.wizzardo:datadog-jvm:0.4+'
-    implementation 'com.wizzardo:epoll:0.3.5-SNAPSHOT'
+//    implementation 'com.wizzardo:http:0.5-SNAPSHOT'
+//    implementation 'com.wizzardo:datadog-jvm:0.4+'
+//    implementation 'com.wizzardo:epoll:0.3.5-SNAPSHOT'
 
+    implementation 'com.wizzardo.tools:tools:0.24-SNAPSHOT'
+    implementation 'com.github.wizzardo:datadog-jvm:-SNAPSHOT'
+//    implementation 'com.wizzardo:simple-websocket-client:0.3-SNAPSHOT'
+
+    implementation files('../simple-websocket-client/build/libs/simple-websocket-client-0.3-SNAPSHOT.jar')
+    implementation files('../epoll/build/libs/epoll-0.3.5-SNAPSHOT.jar')
+    implementation files('../http/build/libs/http-0.5-SNAPSHOT.jar')
 
     implementation "org.postgresql:postgresql:42.7.3"
 
