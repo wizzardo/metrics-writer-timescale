@@ -1,10 +1,10 @@
-FROM bellsoft/liberica-openjdk-alpine:21
+FROM bellsoft/liberica-openjdk-alpine:25
 
 WORKDIR /app
 
 COPY ./build/libs/metrics-writer-timescale-all-1.0-SNAPSHOT.jar app.jar
 
-ENV JAVA_OPTS "-Xmx1024m \
+ENV JAVA_OPTS="-Xmx1024m \
     -Xss256k \
     --add-opens java.base/java.lang=ALL-UNNAMED \
     --add-opens java.base/java.nio=ALL-UNNAMED \
