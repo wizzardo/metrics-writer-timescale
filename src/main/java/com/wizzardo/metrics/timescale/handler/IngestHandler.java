@@ -131,13 +131,13 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                         new Field(hypertablesTable, "hypertable_name")
                 )
                 .from(hypertablesTable)
-                .where(new Field.BooleanField(hypertablesTable, "compression_enabled").eq(false))
+//                .where(new Field.BooleanField(hypertablesTable, "compression_enabled").eq(false))
                 .fetchInto(HyperTable.class);
 
         for (HyperTable table : tables) {
             try {
                 dbService.withDBTransaction(c -> {
-                    enableCompression(c, table.hypertable_schema, table.hypertable_name);
+                    enableCompression(c, table.hypertable_schema, table.hypertable_name, true);
                     return Void.TYPE;
                 });
             } catch (Exception e) {
@@ -146,7 +146,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         }
     }
 
-    private void enableCompression(Connection c, String hypertable_schema, String hypertable_name) throws SQLException {
+    private void enableCompression(Connection c, String hypertable_schema, String hypertable_name, boolean removeOld) throws SQLException {
         String sql = "ALTER TABLE " + hypertable_schema + "." + hypertable_name + " SET (timescaledb.compress,\n" +
                      "                timescaledb.compress_orderby = 'created_at DESC',\n" +
                      "                timescaledb.compress_segmentby = 'tags_id'\n" +
@@ -154,7 +154,13 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         System.out.println(sql);
         c.createStatement().execute(sql);
 
-        sql = "SELECT add_compression_policy('" + hypertable_schema + "." + hypertable_name + "', compress_after => INTERVAL '2h')";
+        if (removeOld) {
+            sql = "SELECT remove_compression_policy('" + hypertable_schema + "." + hypertable_name + "', true)";
+            System.out.println(sql);
+            c.createStatement().execute(sql);
+        }
+
+        sql = "SELECT add_compression_policy('" + hypertable_schema + "." + hypertable_name + "', compress_after => INTERVAL '3d')";
         System.out.println(sql);
         c.createStatement().execute(sql);
     }
@@ -427,7 +433,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                 Table metricTagsTable = getTagsTable(QueryBuilder.withConnection(c), schema, tagsTableName);
 
                 createMetricViewTable(c, tableName, metricTagsTable);
-                enableCompression(c, schema, tableName);
+                enableCompression(c, schema, tableName, false);
 
                 c.commit();
 
