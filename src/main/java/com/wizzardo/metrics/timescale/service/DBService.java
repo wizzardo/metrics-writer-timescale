@@ -16,6 +16,13 @@ public class DBService extends DBTools implements Service, PostConstruct {
 
     DataSourceConfig dataSourceConfig;
 
+    public DBService() {
+    }
+
+    public DBService(DataSourceConfig dataSourceConfig) {
+        this.dataSourceConfig = dataSourceConfig;
+    }
+
     public void init() {
         this.dataSource = new SimpleConnectionPool(createDatasource(), 4);
         migrate();

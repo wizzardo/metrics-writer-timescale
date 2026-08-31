@@ -17,7 +17,7 @@ public class DataSourceConfig implements Configuration {
         this("", "", "");
     }
 
-    protected DataSourceConfig(String url, String username, String password) {
+    public DataSourceConfig(String url, String username, String password) {
         this.url = url;
         this.username = username;
         this.password = password;
