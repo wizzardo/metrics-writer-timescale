@@ -18,6 +18,7 @@ import com.wizzardo.tools.cache.Cache;
 import com.wizzardo.tools.interfaces.Mapper;
 import com.wizzardo.tools.json.JsonTools;
 import com.wizzardo.tools.misc.Pair;
+import com.wizzardo.tools.misc.Unchecked;
 import com.wizzardo.tools.misc.With;
 import com.wizzardo.tools.sql.query.Condition;
 import com.wizzardo.tools.sql.query.Field;
@@ -26,6 +27,7 @@ import com.wizzardo.tools.sql.query.Table;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.util.*;
@@ -317,7 +319,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                     List<List<String>> tags = data.tags;
                     String tableName = toTableName(data.name);
                     Pair<Table, Table> tables = tablesCache.get(tableName, tn -> createMetricTable(tableName, tags));
-                    GetTagsResult tagsResult = getTags(data, tables);
+                    GetTagsResult tagsResult = getOrCreateTags(data, tables);
                     metric.tagsId = tagsResult.id;
                     if (!tagsResult.cached)
                         notCachedTags[0]++;
@@ -469,7 +471,13 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         boolean created;
     }
 
-    GetTagsResult getTags(MetricData metricData, Pair<Table, Table> metricTables) {
+    TagsCacheKey createTagsCacheKey(MetricData metricData, String tableName) {
+        internStrings(metricData.tags);
+        metricData.tags.sort(Comparator.comparing(List::getFirst));
+        return new TagsCacheKey(tableName, metricData.tags);
+    }
+
+    GetTagsResult getOrCreateTags(MetricData metricData, Pair<Table, Table> metricTables) {
         internStrings(metricData.tags);
         metricData.tags.sort(Comparator.comparing(List::getFirst));
         TagsCacheKey key = new TagsCacheKey(metricTables.key.getName(), metricData.tags);
@@ -539,21 +547,36 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         return result;
     }
 
-    private Integer getTagId(QueryBuilder.WrapConnectionStep db, String value) {
+    Integer getTagId(QueryBuilder.WrapConnectionStep db, String value) {
         if (value == null) {
             return null;
         }
         return tagCache.get(value, name -> {
-            TagTable tag = new TagTable("metrics._tag", null);
-            QueryBuilder.ReturningStep query = db.insertInto(tag)
-                    .values(With.with(new Tag(), it -> it.name = name))
-                    .onConflictDoUpdate(tag.NAME)
-                    .set(tag.NAME.eq(name))
-                    .returning(tag.ID);
-//            System.out.println(query.toSql());
-            return query
-                    .fetchOneInto(IntIdHolder.class).id;
-//                                    return db.select(tagTable.FIELDS).from(tagTable).where(tagTable.NAME.eq(name)).fetchOneInto(Tag.class).id;
+            Connection connection = db.getConnection();
+            //noinspection SqlSourceToSinkFlow
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "WITH ins AS (" +
+                    " INSERT INTO " + schema + "._tag (name)" +
+                    " VALUES (?)" +
+                    " ON CONFLICT (name) DO NOTHING" +
+                    " RETURNING id" +
+                    ") " +
+                    "SELECT id FROM ins " +
+                    "UNION ALL " +
+                    "SELECT id FROM " + schema + "._tag WHERE name = ? " +
+                    "LIMIT 1"
+            )) {
+                statement.setString(1, name);
+                statement.setString(2, name);
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    if (resultSet.next()) {
+                        return resultSet.getInt(1);
+                    }
+                }
+            } catch (SQLException e) {
+                throw Unchecked.rethrow(e);
+            }
+            throw new IllegalStateException("Failed to get or create tag for value: " + name);
         });
     }
 
