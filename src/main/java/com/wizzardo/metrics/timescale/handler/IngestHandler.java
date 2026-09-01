@@ -7,10 +7,7 @@ import com.wizzardo.http.framework.di.PostConstruct;
 import com.wizzardo.http.request.Request;
 import com.wizzardo.http.response.Response;
 import com.wizzardo.http.response.Status;
-import com.wizzardo.metrics.timescale.db.generated.Tables;
-import com.wizzardo.metrics.timescale.db.generated.TagTable;
 import com.wizzardo.metrics.timescale.db.model.Metric;
-import com.wizzardo.metrics.timescale.db.model.Tag;
 import com.wizzardo.metrics.timescale.misc.InsertFieldsStep;
 import com.wizzardo.metrics.timescale.model.MetricData;
 import com.wizzardo.metrics.timescale.service.DBService;
@@ -32,6 +29,7 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Injectable
 public class IngestHandler extends RestHandler implements PostConstruct {
@@ -272,7 +270,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         List<Field> fields = tagsTable.getFields();
         for (int i = 0; i < fields.size(); i++) {
             Field f = fields.get(i);
-            if(f.getName().equals("id"))
+            if (f.getName().equals("id"))
                 continue;
 
             sb.append(", ");
@@ -284,7 +282,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
 
         for (int i = 0; i < fields.size(); i++) {
             Field f = fields.get(i);
-            if(f.getName().equals("id"))
+            if (f.getName().equals("id"))
                 continue;
             String tag = f.getName();
             sb.append(" left join ").append(schema).append("._tag ")
@@ -317,42 +315,97 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         long startPreparing = System.nanoTime();
         int[] createdTags = new int[]{0};
         int[] notCachedTags = new int[]{0};
-        Map<String, List<Metric>> metrics = metricData.stream()
-                .map(data -> {
-                    Metric metric = new Metric();
-                    metric.value = data.value;
-                    if (data.timestamp != 0)
-                        metric.createdAt = new Timestamp(data.timestamp / 1000_000);
-                    else
-                        metric.createdAt = new Timestamp(System.currentTimeMillis());
 
-                    List<List<String>> tags = data.tags;
-                    String tableName = toTableName(data.name);
-                    Pair<Table, Table> tables = tablesCache.get(tableName, tn -> createMetricTable(tableName, tags));
-                    GetTagsResult tagsResult = getOrCreateTags(data, tables);
-                    metric.tagsId = tagsResult.id;
-                    if (!tagsResult.cached)
-                        notCachedTags[0]++;
-                    if (tagsResult.created)
-                        createdTags[0]++;
-
-                    return Pair.of(tableName, metric);
-                })
+        Map<String, List<MetricData>> metricsByName = metricData.stream()
+                .map(data -> Pair.of(data.name, data))
                 .collect(Collectors.groupingBy(
                         p -> p.key,
                         Collectors.mapping(p -> p.value, Collectors.toList())
                 ));
+
+        List<Pair<String, List<Metric>>> metricsPairs = metricsByName.values().stream().map(list -> {
+            String tableName = toTableName(list.getFirst().name);
+            List<Pair<Metric, MetricData>> l = list.stream().map(data -> {
+                Metric metric = new Metric();
+                metric.value = data.value;
+                if (data.timestamp != 0)
+                    metric.createdAt = new Timestamp(data.timestamp / 1000_000);
+                else
+                    metric.createdAt = new Timestamp(System.currentTimeMillis());
+
+                {
+                    List<List<String>> tags = data.tags;
+                    Pair<Table, Table> tables = tablesCache.get(tableName, tn -> createMetricTable(tableName, tags));
+                    if (data.tags.stream().anyMatch(kv -> tables.value.getFields().stream().noneMatch(field -> isColumnMatchingTag(field, toColumnName(kv.get(0)))))) {
+                        updateColumns(tables, data.tags);
+                    }
+                }
+
+                TagsCacheKey cacheKey = createTagsCacheKey(data, tableName);
+                Integer tagsId = tagsCache.get(cacheKey);
+                if (tagsId != null) {
+                    metric.tagsId = tagsId;
+                }
+                return Pair.of(metric, data);
+            }).toList();
+
+            List<Pair<Metric, MetricData>> withoutTags = l.stream().filter(metric -> metric.key.tagsId == 0).toList();
+
+            Pair<Table, Table> tables = tablesCache.get(tableName);
+            for (Pair<Metric, MetricData> metric : withoutTags) {
+                createdTags[0]++;
+                notCachedTags[0]++;
+                metric.key.tagsId = getOrCreateTags(metric.value, tables).id;
+            }
+
+            return Pair.of(tableName, l.stream().map(p -> p.key).toList());
+        }).toList();
+
+//        Map<String, List<Metric>> metrics = metricData.stream()
+//                .map(data -> {
+//                    Metric metric = new Metric();
+//                    metric.value = data.value;
+//                    if (data.timestamp != 0)
+//                        metric.createdAt = new Timestamp(data.timestamp / 1000_000);
+//                    else
+//                        metric.createdAt = new Timestamp(System.currentTimeMillis());
+//
+//                    List<List<String>> tags = data.tags;
+//                    String tableName = toTableName(data.name);
+//                    Pair<Table, Table> tables = tablesCache.get(tableName, tn -> createMetricTable(tableName, tags));
+//                    GetTagsResult tagsResult = getOrCreateTags(data, tables);
+//                    metric.tagsId = tagsResult.id;
+//                    if (!tagsResult.cached)
+//                        notCachedTags[0]++;
+//                    if (tagsResult.created)
+//                        createdTags[0]++;
+//
+//                    return Pair.of(tableName, metric);
+//                })
+//                .collect(Collectors.groupingBy(
+//                        p -> p.key,
+//                        Collectors.mapping(p -> p.value, Collectors.toList())
+//                ));
 
         long stopPreparing = System.nanoTime();
 
         StringBuilder sb = new StringBuilder(256);
         sb.append("p ").append(createdTags[0]).append(" ").append(notCachedTags[0]).append(":").append(((int) (stopPreparing - startPreparing) / 1000f) / 1000f).append("ms ");
 
-        for (Map.Entry<String, List<Metric>> entry : metrics.entrySet()) {
-            String key = entry.getKey();
-            List<Metric> value = entry.getValue();
+//        for (Map.Entry<String, List<Metric>> entry : metrics.entrySet()) {
+//            String key = entry.getKey();
+//            List<Metric> value = entry.getValue();
+//            long startInserting = System.nanoTime();
+//            insert(key, value);
+//            long stopInserting = System.nanoTime();
+//            sb.append("i ").append(value.size()).append(": ").append(((int) (stopInserting - startInserting) / 1000f) / 1000f).append("ms ");
+//        }
+
+        for (Pair<String, List<Metric>> entry : metricsPairs) {
+            String tableName = entry.key;
+            List<Metric> value = entry.value;
             long startInserting = System.nanoTime();
-            insert(key, value);
+            insert(tableName, value);
             long stopInserting = System.nanoTime();
             sb.append("i ").append(value.size()).append(": ").append(((int) (stopInserting - startInserting) / 1000f) / 1000f).append("ms ");
         }
@@ -392,16 +445,16 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             try {
                 PreparedStatement statement = c.prepareStatement(
                         "create table " + schema + "." + tableName + " (\n" +
-                        "        created_at     TIMESTAMPTZ      NOT NULL,\n" +
-                        "        tags_id        INTEGER          NOT NULL,\n" +
-                        "        value          DOUBLE PRECISION NOT NULL\n" +
-                        ")"
+                                "        created_at     TIMESTAMPTZ      NOT NULL,\n" +
+                                "        tags_id        INTEGER          NOT NULL,\n" +
+                                "        value          DOUBLE PRECISION NOT NULL\n" +
+                                ")"
                 );
 
                 statement.execute();
 
                 String tagsTableName = "_tags_" + tableName;
-                String tagsTableNameWithSchema = schema+"._tags_" + tableName;
+                String tagsTableNameWithSchema = schema + "._tags_" + tableName;
                 StringBuilder sb = new StringBuilder()
                         .append("create table ").append(tagsTableNameWithSchema).append(" (\n")
                         .append("id SERIAL PRIMARY KEY,\n");
@@ -493,68 +546,73 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         TagsCacheKey key = new TagsCacheKey(metricTables.key.getName(), metricData.tags);
         GetTagsResult result = new GetTagsResult();
         result.id = tagsCache.get(key, s ->
-                        dbService.withBuilder(db -> {
-                            result.cached = false;
-                            Table tagsTable = metricTables.value;
+                dbService.withBuilder(db -> {
+                    result.cached = false;
+                    Table tagsTable = metricTables.value;
 
-                            if (metricData.tags.stream().anyMatch(kv -> metricTables.value.getFields().stream().noneMatch(field -> isColumnMatchingTag(field, toColumnName(kv.get(0)))))) {
-                                tagsTable = updateColumns(metricTables, metricData.tags);
-                            }
+                    if (metricData.tags.stream().anyMatch(kv -> metricTables.value.getFields().stream().noneMatch(field -> isColumnMatchingTag(field, toColumnName(kv.get(0)))))) {
+                        tagsTable = updateColumns(metricTables, metricData.tags);
+                    }
 
-                            List<Field> fields = tagsTable.getFields();
-
-                            Condition condition = Condition.TRUE_CONDITION;
-                            for (int i = 1; i < fields.size(); i++) {
-                                Field field = fields.get(i);
-                                String value = null;
-                                for (int j = 0; j < metricData.tags.size(); j++) {
-                                    List<String> kv = metricData.tags.get(j);
-                                    if (isColumnMatchingTag(field, toColumnName(kv.get(0)))) {
-                                        value = kv.get(1);
-                                        break;
-                                    }
-                                }
-
-                                Integer tagId = getTagId(db, value);
-                                condition = condition.and(((Field.IntField) field).eq(tagId));
-                            }
-
-
-                            QueryBuilder.WhereStep q = db.select(fields.get(0))
-                                    .from(tagsTable)
-                                    .where(condition);
-//                    System.out.println(q.toSql());
-                            TagIdHolder idHolder = q.fetchOneInto(TagIdHolder.class);
-
-                            if (idHolder == null) {
-                                List<Field> tagsColumns = fields.subList(1, fields.size());
-                                QueryBuilder.InsertValuesStep query = new QueryBuilder.InsertValuesStep(
-//                                        db.insertInto(tagsTable).fields(tagsColumns),
-                                        new InsertFieldsStep(db.insertInto(tagsTable), tagsColumns),
-                                        metricData.tags,
-                                        tagsColumns.stream().map(field -> (Field.ToSqlMapper) (o, builder) -> {
-                                            for (int j = 0; j < metricData.tags.size(); j++) {
-                                                List<String> kv = metricData.tags.get(j);
-                                                if (isColumnMatchingTag(field, toColumnName(kv.get(0)))) {
-                                                    Integer tagId = getTagId(db, kv.get(1));
-                                                    builder.setField(tagId);
-                                                    return;
-                                                }
-                                            }
-                                            builder.setField((Integer) null);
-                                        }).toList()
-                                );
-
-//                                System.out.println(query.toSql());
-
-                                int id = (int) query.executeInsert(fields.get(0));
-                                result.created = true;
-                                return id;
-                            }
-                            return idHolder.id;
-                        })
+                    List<Field> fields = tagsTable.getFields();
+                    TagIdHolder idHolder = selectTags(db, metricData.tags, fields, tagsTable);
+                    if (idHolder == null) {
+                        result.created = true;
+                        return insertTags(db, metricData.tags, fields, tagsTable);
+                    }
+                    return idHolder.id;
+                })
         );
         return result;
+    }
+
+    private TagIdHolder selectTags(QueryBuilder.WrapConnectionStep db, List<List<String>> tags, List<Field> fields, Table tagsTable) throws SQLException {
+        Condition condition = Condition.TRUE_CONDITION;
+        for (int i = 1; i < fields.size(); i++) {
+            Field field = fields.get(i);
+            String value = null;
+            for (int j = 0; j < tags.size(); j++) {
+                List<String> kv = tags.get(j);
+                if (isColumnMatchingTag(field, toColumnName(kv.get(0)))) {
+                    value = kv.get(1);
+                    break;
+                }
+            }
+
+            Integer tagId = getTagId(db, value);
+            condition = condition.and(((Field.IntField) field).eq(tagId));
+        }
+
+
+        QueryBuilder.WhereStep q = db.select(fields.get(0))
+                .from(tagsTable)
+                .where(condition);
+//        System.out.println(q.toSql());
+        TagIdHolder idHolder = q.fetchOneInto(TagIdHolder.class);
+        return idHolder;
+    }
+
+    private int insertTags(QueryBuilder.WrapConnectionStep db, List<List<String>> tags, List<Field> fields, Table tagsTable) throws SQLException {
+        List<Field> tagsColumns = fields.subList(1, fields.size());
+        QueryBuilder.InsertValuesStep query = new QueryBuilder.InsertValuesStep(
+                new InsertFieldsStep(db.insertInto(tagsTable), tagsColumns),
+                tags,
+                tagsColumns.stream().map(field -> (Field.ToSqlMapper) (o, builder) -> {
+                    for (int j = 0; j < tags.size(); j++) {
+                        List<String> kv = tags.get(j);
+                        if (isColumnMatchingTag(field, toColumnName(kv.get(0)))) {
+                            Integer tagId = getTagId(db, kv.get(1));
+                            builder.setField(tagId);
+                            return;
+                        }
+                    }
+                    builder.setField((Integer) null);
+                }).toList()
+        );
+
+//        System.out.println(query.toSql());
+
+        return (int) query.executeInsert(fields.get(0));
     }
 
     Integer getTagId(QueryBuilder.WrapConnectionStep db, String value) {
@@ -564,7 +622,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         return tagCache.get(value, name -> {
             Connection connection = db.getConnection();
             //noinspection SqlSourceToSinkFlow
-            try (PreparedStatement statement = connection.prepareStatement(
+            try (PreparedStatement statement = connection.prepareStatement("" +
                     "WITH ins AS (" +
                     " INSERT INTO " + schema + "._tag (name)" +
                     " VALUES (?)" +
