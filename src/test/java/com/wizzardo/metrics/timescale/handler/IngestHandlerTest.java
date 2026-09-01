@@ -3,6 +3,9 @@ package com.wizzardo.metrics.timescale.handler;
 import com.wizzardo.http.framework.di.DependencyFactory;
 import com.wizzardo.metrics.timescale.IntegrationTestBase;
 import com.wizzardo.metrics.timescale.service.DBService;
+import com.wizzardo.tools.misc.Pair;
+import com.wizzardo.tools.sql.query.Field;
+import com.wizzardo.tools.sql.query.Table;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -10,6 +13,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -224,5 +228,170 @@ public class IngestHandlerTest extends IntegrationTestBase {
                 return null;
             });
         }
+    }
+
+    @Test
+    public void testImportTagsBatch() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        String tableName = "batch_metric_" + System.nanoTime();
+        List<List<String>> initialTags = List.of(
+                List.of("host", "srv1"),
+                List.of("env", "prod"),
+                List.of("region", "us-east")
+        );
+        Pair<Table, Table> tables =
+                handler.tablesCache.get(tableName, tn -> handler.createMetricTable(tableName, initialTags));
+        Table tagsTable = tables.value;
+        List<Field> fields = tagsTable.getFields();
+
+        // 1. null / empty tagsList returns empty map
+        Map<List<List<String>>, Integer> nullResult = dbService.withBuilder(db -> handler.importTags(db, null, fields, tagsTable));
+        Assertions.assertNotNull(nullResult);
+        Assertions.assertTrue(nullResult.isEmpty());
+
+        Map<List<List<String>>, Integer> emptyResult = dbService.withBuilder(db -> handler.importTags(db, Collections.emptyList(), fields, tagsTable));
+        Assertions.assertNotNull(emptyResult);
+        Assertions.assertTrue(emptyResult.isEmpty());
+
+        // 2. Insert batch of distinct tags
+        List<List<String>> t1 = new ArrayList<>(List.of(new ArrayList<>(List.of("host", "h1")), new ArrayList<>(List.of("env", "prod")), new ArrayList<>(List.of("region", "us-east"))));
+        List<List<String>> t2 = new ArrayList<>(List.of(new ArrayList<>(List.of("host", "h2")), new ArrayList<>(List.of("env", "stage")), new ArrayList<>(List.of("region", "us-west"))));
+        List<List<String>> t3 = new ArrayList<>(List.of(new ArrayList<>(List.of("host", "h3")), new ArrayList<>(List.of("env", "dev")))); // missing region (null)
+
+        List<List<List<String>>> batch1 = List.of(t1, t2, t3);
+        Map<List<List<String>>, Integer> result1 = dbService.withBuilder(db -> handler.importTags(db, batch1, fields, tagsTable));
+
+        Assertions.assertNotNull(result1);
+        Assertions.assertEquals(3, result1.size());
+        Integer id1 = result1.get(t1);
+        Integer id2 = result1.get(t2);
+        Integer id3 = result1.get(t3);
+        Assertions.assertNotNull(id1);
+        Assertions.assertNotNull(id2);
+        Assertions.assertNotNull(id3);
+        Assertions.assertTrue(id1 > 0);
+        Assertions.assertTrue(id2 > 0);
+        Assertions.assertTrue(id3 > 0);
+        Assertions.assertEquals(3, new HashSet<>(result1.values()).size());
+
+        // Verify selectTags returns identical IDs
+        dbService.withBuilder(db -> {
+            Assertions.assertEquals(id1, handler.selectTags(db, t1, fields, tagsTable).id);
+            Assertions.assertEquals(id2, handler.selectTags(db, t2, fields, tagsTable).id);
+            Assertions.assertEquals(id3, handler.selectTags(db, t3, fields, tagsTable).id);
+            return null;
+        });
+
+        // 3. Batch with duplicates within the same batch
+        List<List<List<String>>> batchWithDuplicates = List.of(t1, t2, t1, t2, t1);
+        Map<List<List<String>>, Integer> dupResult = dbService.withBuilder(db -> handler.importTags(db, batchWithDuplicates, fields, tagsTable));
+        Assertions.assertEquals(2, dupResult.size());
+        Assertions.assertEquals(id1, dupResult.get(t1));
+        Assertions.assertEquals(id2, dupResult.get(t2));
+
+        // 4. Mixed batch: existing tags + new tags on a fresh handler (so not in cache)
+        IngestHandler handler2 = new IngestHandler();
+        handler2.dbService = dbService;
+
+        List<List<String>> t4 = new ArrayList<>(List.of(new ArrayList<>(List.of("host", "h4")), new ArrayList<>(List.of("env", "prod"))));
+        List<List<String>> t5 = new ArrayList<>(List.of(new ArrayList<>(List.of("host", "h5")), new ArrayList<>(List.of("region", "eu-central"))));
+        List<List<List<String>>> mixedBatch = List.of(t1, t4, t2, t5);
+
+        Map<List<List<String>>, Integer> mixedResult = dbService.withBuilder(db -> handler2.importTags(db, mixedBatch, fields, tagsTable));
+        Assertions.assertEquals(4, mixedResult.size());
+        Assertions.assertEquals(id1, mixedResult.get(t1));
+        Assertions.assertEquals(id2, mixedResult.get(t2));
+        Integer id4 = mixedResult.get(t4);
+        Integer id5 = mixedResult.get(t5);
+        Assertions.assertNotNull(id4);
+        Assertions.assertNotNull(id5);
+        Assertions.assertTrue(id4 > 0);
+        Assertions.assertTrue(id5 > 0);
+
+        // Verify total row count in metrics._tags_<tableName> is exactly 5
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT count(*) FROM " + tagsTable.getName())) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(5, rs.getInt(1));
+                }
+            }
+            return null;
+        });
+    }
+
+    @Test
+    public void testConcurrentImportTagsBatch() throws Exception {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        String tableName = "concurrent_tags_metric_" + System.nanoTime();
+        List<List<String>> initialTags = List.of(
+                List.of("host", "srv1"),
+                List.of("env", "prod")
+        );
+        Pair<Table, Table> tables =
+                handler.tablesCache.get(tableName, tn -> handler.createMetricTable(tableName, initialTags));
+        Table tagsTable = tables.value;
+        List<Field> fields = tagsTable.getFields();
+
+        String prefix = "conc_host_" + System.nanoTime() + "_";
+
+        int threads = 10;
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        List<Callable<Map<List<List<String>>, Integer>>> tasks = new ArrayList<>();
+
+        for (int i = 0; i < threads; i++) {
+            tasks.add(() -> {
+                IngestHandler h = new IngestHandler();
+                h.dbService = dbService;
+                List<List<List<String>>> tagsList = new ArrayList<>();
+                for (int j = 0; j < 10; j++) {
+                    tagsList.add(new ArrayList<>(List.of(
+                            new ArrayList<>(List.of("host", prefix + (j % 5))),
+                            new ArrayList<>(List.of("env", "env_" + (j % 3)))
+                    )));
+                }
+                return dbService.withBuilder(db -> h.importTags(db, tagsList, fields, tagsTable));
+            });
+        }
+
+        List<Future<Map<List<List<String>>, Integer>>> futures = executor.invokeAll(tasks);
+        Map<List<List<String>>, Integer> expected = null;
+        for (var future : futures) {
+            Map<List<List<String>>, Integer> res = future.get();
+            Assertions.assertNotNull(res);
+            if (expected == null) {
+                expected = res;
+            } else {
+                Assertions.assertEquals(expected, res);
+            }
+        }
+        executor.shutdown();
+
+        // Verify count of rows in _tags table matches expected distinct count
+        Set<List<List<String>>> distinctSets = new HashSet<>();
+        for (int j = 0; j < 10; j++) {
+            List<List<String>> tags = new ArrayList<>(List.of(
+                    new ArrayList<>(List.of("host", prefix + (j % 5))),
+                    new ArrayList<>(List.of("env", "env_" + (j % 3)))
+            ));
+            tags.sort(Comparator.comparing(List::getFirst));
+            distinctSets.add(tags);
+        }
+
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT count(*) FROM " + tagsTable.getName())) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(distinctSets.size(), rs.getInt(1));
+                }
+            }
+            return null;
+        });
     }
 }

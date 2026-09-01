@@ -352,10 +352,17 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             List<Pair<Metric, MetricData>> withoutTags = l.stream().filter(metric -> metric.key.tagsId == 0).toList();
 
             Pair<Table, Table> tables = tablesCache.get(tableName);
+            List<List<List<String>>> allTags = withoutTags.stream().map(m -> m.value.tags).toList();
+
+            Table tagsTable = tables.value;
+            List<Field> fields = tagsTable.getFields();
+            Map<List<List<String>>, Integer> insertedTags = dbService.withBuilder(db -> importTags(db, allTags, fields, tableName, new HashMap<>()));
+
             for (Pair<Metric, MetricData> metric : withoutTags) {
                 createdTags[0]++;
                 notCachedTags[0]++;
-                metric.key.tagsId = getOrCreateTags(metric.value, tables).id;
+//                metric.key.tagsId = getOrCreateTags(metric.value, tables).id;
+                metric.key.tagsId = insertedTags.get(metric.value.tags);
             }
 
             return Pair.of(tableName, l.stream().map(p -> p.key).toList());
@@ -439,7 +446,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         }
     }
 
-    private Pair<Table, Table> createMetricTable(String tableName, List<List<String>> initialTags) {
+    Pair<Table, Table> createMetricTable(String tableName, List<List<String>> initialTags) {
         return dbService.withDB(c -> {
             c.setAutoCommit(false);
             try {
@@ -566,7 +573,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         return result;
     }
 
-    private TagIdHolder selectTags(QueryBuilder.WrapConnectionStep db, List<List<String>> tags, List<Field> fields, Table tagsTable) throws SQLException {
+    TagIdHolder selectTags(QueryBuilder.WrapConnectionStep db, List<List<String>> tags, List<Field> fields, Table tagsTable) throws SQLException {
         Condition condition = Condition.TRUE_CONDITION;
         for (int i = 1; i < fields.size(); i++) {
             Field field = fields.get(i);
@@ -580,7 +587,11 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             }
 
             Integer tagId = getTagId(db, value);
-            condition = condition.and(((Field.IntField) field).eq(tagId));
+            if (tagId == null) {
+                condition = condition.and(((Field.IntField) field).isNull());
+            } else {
+                condition = condition.and(((Field.IntField) field).eq(tagId));
+            }
         }
 
 
@@ -613,6 +624,202 @@ public class IngestHandler extends RestHandler implements PostConstruct {
 //        System.out.println(query.toSql());
 
         return (int) query.executeInsert(fields.get(0));
+    }
+
+    Map<List<List<String>>, Integer> importTags(QueryBuilder.WrapConnectionStep db, List<List<List<String>>> tagsList, List<Field> fields, Table tagsTable) {
+        if (tagsList == null || tagsList.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        List<List<List<String>>> distinctTags = new ArrayList<>();
+        Set<List<List<String>>> seen = new HashSet<>();
+        HashMap<List<List<String>>, Integer> into = new HashMap<>();
+
+        for (List<List<String>> tags : tagsList) {
+            if (tags == null)
+                continue;
+
+//            internStrings(tags);
+//            try {
+//                tags.sort(Comparator.comparing(List::getFirst));
+//            } catch (UnsupportedOperationException ignored) {
+//            }
+
+            Integer cachedId = tagsCache.get(new TagsCacheKey(tagsTable.getName(), tags));
+//            if (cachedId == null) {
+//                cachedId = tagsCache.get(new TagsCacheKey(shortTableName, tags));
+//            }
+
+            if (cachedId != null) {
+                into.put(tags, cachedId);
+            } else if (seen.add(tags)) {
+                distinctTags.add(tags);
+            }
+        }
+
+        if (distinctTags.isEmpty()) {
+            return into;
+        }
+
+        // Collect all tag string values and batch fetch/create their IDs in metrics._tag
+        Set<String> tagValues = new HashSet<>();
+        for (List<List<String>> tags : distinctTags) {
+            for (List<String> kv : tags) {
+                if (kv != null && kv.size() > 1 && kv.get(1) != null) {
+                    tagValues.add(kv.get(1));
+                }
+            }
+        }
+        Map<String, Integer> tagIdMap = getTagIds(db, tagValues);
+
+        return importTags(db, distinctTags, fields, tagsTable.getName(), into);
+    }
+
+    Map<List<List<String>>, Integer> importTags(QueryBuilder.WrapConnectionStep db, List<List<List<String>>> tagsList, List<Field> fields, String tableName, Map<List<List<String>>, Integer> into) {
+        if (tagsList == null || tagsList.isEmpty()) {
+            return into != null ? into : Collections.emptyMap();
+        }
+
+//        String tableName = tagsTable.getName();
+//        String shortTableName = tableName;
+//        if (shortTableName.contains("._tags_")) {
+//            shortTableName = shortTableName.substring(shortTableName.indexOf("._tags_") + 7);
+//        } else if (shortTableName.startsWith("_tags_")) {
+//            shortTableName = shortTableName.substring(6);
+//        }
+
+
+
+//        List<Field> tagsColumns = fields.stream()
+//                .filter(f -> !f.getName().replace("\"", "").equals("id"))
+//                .toList();
+
+//        if (tagsColumns.isEmpty()) {
+//            Connection connection = db.getConnection();
+//            try (PreparedStatement statement = connection.prepareStatement("SELECT id FROM " + tableName + " LIMIT 1");
+//                 ResultSet rs = statement.executeQuery()) {
+//                int id;
+//                if (rs.next()) {
+//                    id = rs.getInt(1);
+//                } else {
+//                    try (PreparedStatement insertStmt = connection.prepareStatement("INSERT INTO " + tableName + " DEFAULT VALUES RETURNING id");
+//                         ResultSet insertRs = insertStmt.executeQuery()) {
+//                        if (insertRs.next()) {
+//                            id = insertRs.getInt(1);
+//                        } else {
+//                            throw new IllegalStateException("Failed to insert into " + tableName);
+//                        }
+//                    }
+//                }
+//                for (List<List<String>> tags : distinctTags) {
+//                    into.put(tags, id);
+//                    tagsCache.put(new TagsCacheKey(shortTableName, tags), id);
+//                    tagsCache.put(new TagsCacheKey(tableName, tags), id);
+//                }
+//            } catch (SQLException e) {
+//                throw Unchecked.rethrow(e);
+//            }
+//            return into;
+//        }
+
+        int distinctCount = tagsList.size();
+        Integer[] rowIds = new Integer[distinctCount];
+        for (int i = 0; i < distinctCount; i++) {
+            rowIds[i] = i;
+        }
+
+        int colCount = fields.size() - 1;
+        Integer[][] colArrays = new Integer[colCount][distinctCount];
+
+        for (int i = 0; i < distinctCount; i++) {
+            List<List<String>> tags = tagsList.get(i);
+            for (int j = 0; j < colCount; j++) {
+                Field field = fields.get(j + 1);
+                Integer tagId = null;
+                for (int k = 0; k < tags.size(); k++) {
+                    List<String> kv = tags.get(k);
+                    if (isColumnMatchingTag(field, toColumnName(kv.get(0)))) {
+                        tagId = tagCache.get(kv.get(1));
+                        break;
+                    }
+                }
+                colArrays[j][i] = tagId;
+            }
+        }
+
+        StringBuilder colNamesSql = new StringBuilder();
+        StringBuilder inpColNamesSql = new StringBuilder();
+        StringBuilder unnestParamsSql = new StringBuilder("?::int[]");
+        StringBuilder joinConditionSql = new StringBuilder();
+        StringBuilder joinInsConditionSql = new StringBuilder();
+
+        for (int j = 0; j < colCount; j++) {
+            String cleanName = fields.get(j + 1).getName().replace("\"", "");
+            String colName = "\"" + cleanName + "\"";
+            String inpColName = "inp.\"" + cleanName + "\"";
+            String insColName = "ins.\"" + cleanName + "\"";
+            String tColName = "t.\"" + cleanName + "\"";
+
+            if (j > 0) {
+                colNamesSql.append(", ");
+                inpColNamesSql.append(", ");
+                joinConditionSql.append(" AND ");
+                joinInsConditionSql.append(" AND ");
+            }
+            colNamesSql.append(colName);
+            inpColNamesSql.append(inpColName);
+            unnestParamsSql.append(", ?::int[]");
+            joinConditionSql.append(tColName).append(" IS NOT DISTINCT FROM ").append(inpColName);
+            joinInsConditionSql.append(insColName).append(" IS NOT DISTINCT FROM ").append(inpColName);
+        }
+
+        String sql = "" +
+                "WITH input AS (\n" +
+                " SELECT * FROM unnest(" + unnestParamsSql + ") AS inp(row_id, " + colNamesSql + ")\n" +
+                "), existing AS (\n" +
+                " SELECT inp.row_id, min(t.id) AS id\n" +
+                " FROM input inp\n" +
+                " JOIN " + tableName + " t ON " + joinConditionSql + "\n" +
+                " GROUP BY inp.row_id\n" +
+                "), ins AS (\n" +
+                " INSERT INTO " + tableName + " (" + colNamesSql + ")\n" +
+                " SELECT DISTINCT " + inpColNamesSql + "\n" +
+                " FROM input inp\n" +
+                " WHERE NOT EXISTS (\n" +
+                "  SELECT 1 FROM existing e WHERE e.row_id = inp.row_id\n" +
+                " )\n" +
+                " RETURNING id, " + colNamesSql + "\n" +
+                ")\n" +
+                "SELECT e.row_id, e.id FROM existing e\n" +
+                "UNION ALL\n" +
+                "SELECT inp.row_id, ins.id\n" +
+                "FROM ins\n" +
+                "JOIN input inp ON " + joinInsConditionSql;
+
+//        System.out.println(sql);
+        Connection connection = db.getConnection();
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setArray(1, connection.createArrayOf("int4", rowIds));
+            for (int j = 0; j < colCount; j++) {
+                statement.setArray(j + 2, connection.createArrayOf("int4", colArrays[j]));
+            }
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    int rowId = resultSet.getInt(1);
+                    int id = resultSet.getInt(2);
+                    List<List<String>> tags = tagsList.get(rowId);
+                    if (into != null)
+                        into.put(tags, id);
+//                    tagsCache.put(new TagsCacheKey(shortTableName, tags), id);
+                    tagsCache.put(new TagsCacheKey(tableName, tags), id);
+                }
+            }
+        } catch (SQLException e) {
+            throw Unchecked.rethrow(e);
+        }
+
+        return into;
     }
 
     Integer getTagId(QueryBuilder.WrapConnectionStep db, String value) {
