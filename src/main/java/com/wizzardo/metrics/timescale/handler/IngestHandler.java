@@ -361,7 +361,8 @@ public class IngestHandler extends RestHandler implements PostConstruct {
 
             Table tagsTable = tables.value;
             List<Field> fields = tagsTable.getFields();
-            Map<List<List<String>>, Integer> insertedTags = dbService.withBuilder(db -> importTags(db, allTags, fields, tagsTable.getName(), new HashMap<>(allTags.size())));
+//            Map<List<List<String>>, Integer> insertedTags = dbService.withBuilder(db -> importTags(db, allTags, fields, tagsTable.getName(), new HashMap<>(allTags.size())));
+            Map<List<List<String>>, Integer> insertedTags = dbService.withBuilder(db -> importTags2(db, allTags, fields, tagsTable.getName(), new HashMap<>(allTags.size())));
 
             for (Pair<Metric, MetricData> metric : withoutTags) {
                 createdTags[0]++;
@@ -533,7 +534,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         return name.toLowerCase().replaceAll("\\W+", "_");
     }
 
-    private String toColumnName(String name) {
+    String toColumnName(String name) {
         name = name.toLowerCase();
         if (name.equals("id"))
             return "_id";
@@ -820,7 +821,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                 "JOIN input inp ON " + joinInsConditionSql;
 
 //        System.out.println(sql);
-        System.out.println("preparing tag combos: " + distinctTags.size());
+        System.out.println("preparing tag combos: " + distinctTags.size() + " columns: " + colCount);
         long start = System.nanoTime();
         Connection connection = db.getConnection();
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
@@ -846,6 +847,309 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         }
         long stop = System.nanoTime();
         System.out.println("tag combos prepared in " + ((stop - start) / 1000000) + "ms");
+
+        return into;
+    }
+
+    Map<List<List<String>>, Integer> importTags2(QueryBuilder.WrapConnectionStep db, List<List<List<String>>> tagsList, List<Field> fields, Table tagsTable) {
+        if (tagsList == null || tagsList.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        List<List<List<String>>> distinctTags = new ArrayList<>();
+        Set<List<List<String>>> seen = new HashSet<>();
+        HashMap<List<List<String>>, Integer> into = new HashMap<>();
+
+        for (List<List<String>> tags : tagsList) {
+            if (tags == null)
+                continue;
+
+            Integer cachedId = tagsCache.get(new TagsCacheKey(tagsTable.getName(), tags));
+            if (cachedId != null) {
+                into.put(tags, cachedId);
+            } else if (seen.add(tags)) {
+                distinctTags.add(tags);
+            }
+        }
+
+        if (distinctTags.isEmpty()) {
+            return into;
+        }
+
+        // Collect all tag string values and batch fetch/create their IDs in metrics._tag
+        Set<String> tagValues = new HashSet<>();
+        for (List<List<String>> tags : distinctTags) {
+            for (List<String> kv : tags) {
+                if (kv != null && kv.size() > 1 && kv.get(1) != null) {
+                    tagValues.add(kv.get(1));
+                }
+            }
+        }
+        Map<String, Integer> tagIdMap = getTagIds(db, tagValues);
+
+        return importTags2(db, distinctTags, fields, tagsTable.getName(), into);
+    }
+
+    Map<List<List<String>>, Integer> importTags2(QueryBuilder.WrapConnectionStep db, List<List<List<String>>> tagsList, List<Field> fields, String tableName, Map<List<List<String>>, Integer> into) {
+        if (tagsList == null || tagsList.isEmpty()) {
+            return into != null ? into : Collections.emptyMap();
+        }
+
+        String shortTableName = tableName;
+        if (shortTableName.contains("._tags_")) {
+            shortTableName = shortTableName.substring(shortTableName.indexOf("._tags_") + 7);
+        } else if (shortTableName.startsWith("_tags_")) {
+            shortTableName = shortTableName.substring(6);
+        }
+
+        List<List<List<String>>> distinctTags = new ArrayList<>();
+        Set<List<List<String>>> seen = new HashSet<>();
+
+        for (List<List<String>> tags : tagsList) {
+            if (tags == null)
+                continue;
+
+            if (seen.add(tags)) {
+                distinctTags.add(tags);
+            }
+        }
+
+        if (distinctTags.isEmpty()) {
+            return into;
+        }
+
+        if (into == null) {
+            into = new HashMap<>(distinctTags.size());
+        }
+
+        int colCount = fields.size() - 1;
+        if (colCount <= 0) {
+            Connection connection = db.getConnection();
+            try (PreparedStatement statement = connection.prepareStatement("SELECT id FROM " + tableName + " LIMIT 1");
+                 ResultSet rs = statement.executeQuery()) {
+                int id;
+                if (rs.next()) {
+                    id = rs.getInt(1);
+                } else {
+                    try (PreparedStatement insertStmt = connection.prepareStatement("INSERT INTO " + tableName + " DEFAULT VALUES RETURNING id");
+                         ResultSet insertRs = insertStmt.executeQuery()) {
+                        if (insertRs.next()) {
+                            id = insertRs.getInt(1);
+                        } else {
+                            throw new IllegalStateException("Failed to insert into " + tableName);
+                        }
+                    }
+                }
+                for (List<List<String>> tags : distinctTags) {
+                    into.put(tags, id);
+                    tagsCache.put(new TagsCacheKey(shortTableName, tags), id);
+                    tagsCache.put(new TagsCacheKey(tableName, tags), id);
+                }
+                return into;
+            } catch (SQLException e) {
+                throw Unchecked.rethrow(e);
+            }
+        }
+
+        Set<String> missingTagValues = null;
+        for (List<List<String>> tags : distinctTags) {
+            for (List<String> kv : tags) {
+                if (kv != null && kv.size() > 1 && kv.get(1) != null) {
+                    if (tagCache.get(kv.get(1)) == null) {
+                        if (missingTagValues == null) missingTagValues = new HashSet<>();
+                        missingTagValues.add(kv.get(1));
+                    }
+                }
+            }
+        }
+        if (missingTagValues != null && !missingTagValues.isEmpty()) {
+            getTagIds(db, missingTagValues);
+        }
+
+        int distinctCount = distinctTags.size();
+        Map<List<Integer>, List<Integer>> tupleToRowIds = new HashMap<>(distinctCount);
+        List<List<Integer>> uniqueTuples = new ArrayList<>(distinctCount);
+
+        for (int i = 0; i < distinctCount; i++) {
+            List<List<String>> tags = distinctTags.get(i);
+            Integer[] tuple = new Integer[colCount];
+            for (int j = 0; j < colCount; j++) {
+                Field field = fields.get(j + 1);
+                Integer tagId = null;
+                for (int k = 0; k < tags.size(); k++) {
+                    List<String> kv = tags.get(k);
+                    if (isColumnMatchingTag(field, toColumnName(kv.get(0)))) {
+                        tagId = tagCache.get(kv.get(1));
+                        break;
+                    }
+                }
+                tuple[j] = tagId;
+            }
+            List<Integer> key = Arrays.asList(tuple);
+            List<Integer> rowIds = tupleToRowIds.get(key);
+            if (rowIds == null) {
+                rowIds = new ArrayList<>(1);
+                tupleToRowIds.put(key, rowIds);
+                uniqueTuples.add(key);
+            }
+            rowIds.add(i);
+        }
+
+        StringBuilder colNamesSql = new StringBuilder();
+        for (int j = 0; j < colCount; j++) {
+            String cleanName = fields.get(j + 1).getName().replace("\"", "");
+            String colName = "\"" + cleanName + "\"";
+            if (j > 0) {
+                colNamesSql.append(", ");
+            }
+            colNamesSql.append(colName);
+        }
+
+        StringBuilder whereSql = new StringBuilder();
+        List<Integer> queryParams = new ArrayList<>();
+
+        for (int t = 0; t < uniqueTuples.size(); t++) {
+            List<Integer> tuple = uniqueTuples.get(t);
+            if (t > 0) {
+                whereSql.append(" OR ");
+            }
+            whereSql.append("(");
+            for (int j = 0; j < colCount; j++) {
+                if (j > 0) {
+                    whereSql.append(" AND ");
+                }
+                String cleanName = fields.get(j + 1).getName().replace("\"", "");
+                String colName = "\"" + cleanName + "\"";
+                Integer val = tuple.get(j);
+                if (val == null) {
+                    whereSql.append(colName).append(" IS NULL");
+                } else {
+                    whereSql.append(colName).append(" = ?");
+                    queryParams.add(val);
+                }
+            }
+            whereSql.append(")");
+        }
+
+        String selectSql = "SELECT id, " + colNamesSql + " FROM " + tableName + " WHERE " + whereSql;
+        boolean[] found = new boolean[distinctCount];
+        Connection connection = db.getConnection();
+
+        {
+//            System.out.println("selecting tag combos: " + tagsList.size() + " columns: " + colCount);
+            long start = System.nanoTime();
+            int counter = 0;
+            try (PreparedStatement statement = connection.prepareStatement(selectSql)) {
+                for (int p = 0; p < queryParams.size(); p++) {
+                    statement.setInt(p + 1, queryParams.get(p));
+                }
+
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        int id = resultSet.getInt(1);
+                        Integer[] tuple = new Integer[colCount];
+                        for (int j = 0; j < colCount; j++) {
+                            int val = resultSet.getInt(j + 2);
+                            if (!resultSet.wasNull()) {
+                                tuple[j] = val;
+                            }
+                        }
+                        List<Integer> key = Arrays.asList(tuple);
+                        List<Integer> rowIds = tupleToRowIds.get(key);
+                        if (rowIds != null) {
+                            for (int rowId : rowIds) {
+                                if (!found[rowId]) {
+                                    found[rowId] = true;
+                                    counter++;
+                                    List<List<String>> tags = distinctTags.get(rowId);
+                                    into.put(tags, id);
+                                    tagsCache.put(new TagsCacheKey(shortTableName, tags), id);
+                                    tagsCache.put(new TagsCacheKey(tableName, tags), id);
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                throw Unchecked.rethrow(e);
+            }
+            long end = System.nanoTime();
+            long ms = (end - start) / 1000000;
+            if (ms > 500)
+                System.out.println("tag combos selected in " + ms + "ms, found " + counter + "/" + distinctCount + "; table: " + tableName);
+        }
+
+        List<List<Integer>> missingTuples = new ArrayList<>();
+        for (List<Integer> tuple : uniqueTuples) {
+            List<Integer> rowIds = tupleToRowIds.get(tuple);
+            boolean anyFound = false;
+            if (rowIds != null) {
+                for (int rowId : rowIds) {
+                    if (found[rowId]) {
+                        anyFound = true;
+                        break;
+                    }
+                }
+            }
+            if (!anyFound) {
+                missingTuples.add(tuple);
+            }
+        }
+
+        if (missingTuples.isEmpty()) {
+            return into;
+        }
+
+        StringBuilder placeholders = new StringBuilder();
+        for (int j = 0; j < colCount; j++) {
+            if (j > 0) {
+                placeholders.append(", ");
+            }
+            placeholders.append("?");
+        }
+
+//        System.out.println("inserting tag combos: " + missingTuples.size() + " columns: " + colCount);
+        long start = System.nanoTime();
+        String insertSql = "INSERT INTO " + tableName + " (" + colNamesSql + ") VALUES (" + placeholders + ")";
+        try (PreparedStatement insertStmt = connection.prepareStatement(insertSql, java.sql.Statement.RETURN_GENERATED_KEYS)) {
+            for (List<Integer> tuple : missingTuples) {
+                for (int j = 0; j < colCount; j++) {
+                    Integer val = tuple.get(j);
+                    if (val == null) {
+                        insertStmt.setNull(j + 1, java.sql.Types.INTEGER);
+                    } else {
+                        insertStmt.setInt(j + 1, val);
+                    }
+                }
+                insertStmt.addBatch();
+            }
+            insertStmt.executeBatch();
+            try (ResultSet rs = insertStmt.getGeneratedKeys()) {
+                int idx = 0;
+                while (rs.next()) {
+                    int id = rs.getInt(1);
+                    List<Integer> tuple = missingTuples.get(idx++);
+                    List<Integer> rowIds = tupleToRowIds.get(tuple);
+                    if (rowIds != null) {
+                        for (int rowId : rowIds) {
+                            found[rowId] = true;
+                            List<List<String>> tags = distinctTags.get(rowId);
+                            into.put(tags, id);
+                            tagsCache.put(new TagsCacheKey(shortTableName, tags), id);
+                            tagsCache.put(new TagsCacheKey(tableName, tags), id);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            throw Unchecked.rethrow(e);
+        }
+        long stop = System.nanoTime();
+        long ms = (stop - start) / 1000000;
+        if (ms > 500)
+            System.out.println("tag combos inserted in " + ms + "ms. table: " + tableName);
 
         return into;
     }
@@ -999,7 +1303,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         });
     }
 
-    private static boolean isColumnMatchingTag(Field field, String columnName) {
+    static boolean isColumnMatchingTag(Field field, String columnName) {
         int i = field.getName().indexOf(columnName);
         return (i == 1 && field.getName().length() == columnName.length() + 2) || (i == 0 && field.getName().length() == columnName.length());
     }
