@@ -304,6 +304,16 @@ public class IngestHandler extends RestHandler implements PostConstruct {
 //            insert(metric);
 //        }
 
+        {
+            HashSet<String> tags = new HashSet<>(metricData.size());
+            for (MetricData metric : metricData) {
+                for (List<String> kv : metric.tags) {
+                    tags.add(kv.get(1));
+                }
+            }
+            dbService.withBuilder(db -> getTagIds(db, tags, null));
+        }
+
         long startPreparing = System.nanoTime();
         int[] createdTags = new int[]{0};
         int[] notCachedTags = new int[]{0};
@@ -336,7 +346,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         long stopPreparing = System.nanoTime();
 
         StringBuilder sb = new StringBuilder(256);
-        sb.append("p ").append(createdTags[0]).append(" ").append(notCachedTags[0]).append(":").append((stopPreparing - startPreparing) / 1000f / 1000f).append("ms ");
+        sb.append("p ").append(createdTags[0]).append(" ").append(notCachedTags[0]).append(":").append(((int) (stopPreparing - startPreparing) / 1000f) / 1000f).append("ms ");
 
         for (Map.Entry<String, List<Metric>> entry : metrics.entrySet()) {
             String key = entry.getKey();
@@ -344,7 +354,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             long startInserting = System.nanoTime();
             insert(key, value);
             long stopInserting = System.nanoTime();
-            sb.append("i ").append(value.size()).append(": ").append((stopInserting - startInserting) / 1000f / 1000f).append("ms ");
+            sb.append("i ").append(value.size()).append(": ").append(((int) (stopInserting - startInserting) / 1000f) / 1000f).append("ms ");
         }
 
         System.out.println(sb);
@@ -578,6 +588,67 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             }
             throw new IllegalStateException("Failed to get or create tag for value: " + name);
         });
+    }
+
+    Map<String, Integer> getTagIds(QueryBuilder.WrapConnectionStep db, Set<String> values) {
+        return getTagIds(db, values, new HashMap<>());
+    }
+
+    Map<String, Integer> getTagIds(QueryBuilder.WrapConnectionStep db, Set<String> values, Map<String, Integer> into) {
+        if (values == null || values.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Set<String> missing = null;
+        for (String value : values) {
+            if (value == null) {
+                continue;
+            }
+            Integer id = tagCache.get(value);
+            if (id != null) {
+                if (into != null)
+                    into.put(value, id);
+            } else {
+                if (missing == null) {
+                    missing = new HashSet<>();
+                }
+                missing.add(value);
+            }
+        }
+
+        if (missing == null || missing.isEmpty()) {
+            return into;
+        }
+
+        Connection connection = db.getConnection();
+        //noinspection SqlSourceToSinkFlow
+        try (PreparedStatement statement = connection.prepareStatement(
+                "WITH input AS (" +
+                        " SELECT unnest(?::text[]) AS name" +
+                        "), ins AS (" +
+                        " INSERT INTO " + schema + "._tag (name)" +
+                        " SELECT name FROM input" +
+                        " ON CONFLICT (name) DO NOTHING" +
+                        " RETURNING id, name" +
+                        ") " +
+                        "SELECT id, name FROM ins " +
+                        "UNION ALL " +
+                        "SELECT t.id, t.name FROM " + schema + "._tag t JOIN input i ON t.name = i.name"
+        )) {
+            statement.setArray(1, connection.createArrayOf("text", missing.toArray(new String[0])));
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    int id = resultSet.getInt(1);
+                    String name = resultSet.getString(2);
+                    tagCache.put(name, id);
+                    if (into != null)
+                        into.put(name, id);
+                }
+            }
+        } catch (SQLException e) {
+            throw Unchecked.rethrow(e);
+        }
+        return into;
     }
 
     private void internStrings(List<List<String>> tags) {
