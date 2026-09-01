@@ -2,6 +2,7 @@ package com.wizzardo.metrics.timescale.handler;
 
 import com.wizzardo.http.framework.di.DependencyFactory;
 import com.wizzardo.metrics.timescale.IntegrationTestBase;
+import com.wizzardo.metrics.timescale.model.MetricData;
 import com.wizzardo.metrics.timescale.service.DBService;
 import com.wizzardo.tools.misc.Pair;
 import com.wizzardo.tools.sql.query.Field;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.Test;
 
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -393,5 +395,326 @@ public class IngestHandlerTest extends IntegrationTestBase {
             }
             return null;
         });
+    }
+
+    private static MetricData metric(String name, double value, long timestampNano, List<List<String>> tags) {
+        MetricData data = new MetricData();
+        data.name = name;
+        data.value = value;
+        data.timestamp = timestampNano;
+        data.tags = new ArrayList<>();
+        if (tags != null) {
+            for (List<String> tag : tags) {
+                data.tags.add(new ArrayList<>(tag));
+            }
+        }
+        return data;
+    }
+
+    @Test
+    public void testHandleMetricsSingleMetric() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        String metricName = "test_cpu_load_" + System.nanoTime();
+        long timestampNano = 1_700_000_000_123_000_000L;
+        Timestamp expectedTimestamp = new Timestamp(1_700_000_000_123L);
+        double expectedValue = 42.5;
+
+        List<List<String>> tags = List.of(
+                List.of("host", "server-1"),
+                List.of("env", "production")
+        );
+        MetricData metricData = metric(metricName, expectedValue, timestampNano, tags);
+
+        handler.handleMetrics(List.of(metricData));
+
+        // 1. Verify in metrics.<tableName>
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT created_at, tags_id, value FROM metrics." + metricName)) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(expectedTimestamp, rs.getTimestamp("created_at"));
+                    Assertions.assertEquals(expectedValue, rs.getDouble("value"), 0.0001);
+                    Assertions.assertTrue(rs.getLong("tags_id") > 0);
+                    Assertions.assertFalse(rs.next());
+                }
+            }
+            return null;
+        });
+
+        // 2. Verify view returns metric data with resolved tag names
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT value, created_at, host, env FROM " + metricName)) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(expectedValue, rs.getDouble("value"), 0.0001);
+                    Assertions.assertEquals(expectedTimestamp, rs.getTimestamp("created_at"));
+                    Assertions.assertEquals("server-1", rs.getString("host"));
+                    Assertions.assertEquals("production", rs.getString("env"));
+                    Assertions.assertFalse(rs.next());
+                }
+            }
+            return null;
+        });
+    }
+
+    @Test
+    public void testHandleMetricsMultipleMetricsAndBatch() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        String metricNameA = "test_metric_a_" + System.nanoTime();
+        String metricNameB = "test_metric_b_" + System.nanoTime();
+
+        List<List<String>> tagsA1 = List.of(List.of("host", "h1"), List.of("dc", "east"));
+        List<List<String>> tagsA2 = List.of(List.of("host", "h2"), List.of("dc", "west"));
+        List<List<String>> tagsB1 = List.of(List.of("service", "auth"));
+        List<List<String>> tagsB2 = List.of(List.of("service", "billing"));
+
+        MetricData a1 = metric(metricNameA, 10.0, 1_700_000_000_100_000_000L, tagsA1);
+        MetricData a2 = metric(metricNameA, 20.0, 1_700_000_000_200_000_000L, tagsA1); // same tags as a1
+        MetricData a3 = metric(metricNameA, 30.0, 1_700_000_000_300_000_000L, tagsA2); // different tags
+        MetricData b1 = metric(metricNameB, 100.0, 1_700_000_000_400_000_000L, tagsB1);
+        MetricData b2 = metric(metricNameB, 200.0, 1_700_000_000_500_000_000L, tagsB2);
+
+        handler.handleMetrics(List.of(a1, a2, a3, b1, b2));
+
+        // Verify metric A table rows and tags_id sharing
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT tags_id, value FROM metrics." + metricNameA + " ORDER BY value")) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    long tagsId1 = rs.getLong("tags_id");
+                    Assertions.assertEquals(10.0, rs.getDouble("value"), 0.0001);
+
+                    Assertions.assertTrue(rs.next());
+                    long tagsId2 = rs.getLong("tags_id");
+                    Assertions.assertEquals(20.0, rs.getDouble("value"), 0.0001);
+                    Assertions.assertEquals(tagsId1, tagsId2, "Identical tags must share the same tags_id");
+
+                    Assertions.assertTrue(rs.next());
+                    long tagsId3 = rs.getLong("tags_id");
+                    Assertions.assertEquals(30.0, rs.getDouble("value"), 0.0001);
+                    Assertions.assertNotEquals(tagsId1, tagsId3, "Different tags must have different tags_id");
+
+                    Assertions.assertFalse(rs.next());
+                }
+            }
+            return null;
+        });
+
+        // Verify metric B table rows
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT count(*) FROM metrics." + metricNameB)) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(2, rs.getInt(1));
+                }
+            }
+            return null;
+        });
+
+        // Verify querying view for metric B
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT value, service FROM " + metricNameB + " ORDER BY value")) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(100.0, rs.getDouble("value"), 0.0001);
+                    Assertions.assertEquals("auth", rs.getString("service"));
+
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(200.0, rs.getDouble("value"), 0.0001);
+                    Assertions.assertEquals("billing", rs.getString("service"));
+
+                    Assertions.assertFalse(rs.next());
+                }
+            }
+            return null;
+        });
+    }
+
+    @Test
+    public void testHandleMetricsSchemaEvolutionAddTagColumns() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        String metricName = "test_evolve_" + System.nanoTime();
+
+        // Batch 1: single tag 'host'
+        MetricData m1 = metric(metricName, 1.0, 1_700_000_001_000_000_000L, List.of(List.of("host", "srv1")));
+        handler.handleMetrics(List.of(m1));
+
+        // Batch 2: new tags 'region' and 'app' added
+        MetricData m2 = metric(metricName, 2.0, 1_700_000_002_000_000_000L, List.of(
+                List.of("host", "srv2"),
+                List.of("region", "us-west"),
+                List.of("app", "payments")
+        ));
+        handler.handleMetrics(List.of(m2));
+
+        // Batch 3: partial tags (only 'region', host and app are null)
+        MetricData m3 = metric(metricName, 3.0, 1_700_000_003_000_000_000L, List.of(
+                List.of("region", "eu-central")
+        ));
+        handler.handleMetrics(List.of(m3));
+
+        // Verify view returns all rows with correct schema evolution columns
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT value, host, region, app FROM " + metricName + " ORDER BY value")) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(1.0, rs.getDouble("value"), 0.0001);
+                    Assertions.assertEquals("srv1", rs.getString("host"));
+                    Assertions.assertNull(rs.getString("region"));
+                    Assertions.assertNull(rs.getString("app"));
+
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(2.0, rs.getDouble("value"), 0.0001);
+                    Assertions.assertEquals("srv2", rs.getString("host"));
+                    Assertions.assertEquals("us-west", rs.getString("region"));
+                    Assertions.assertEquals("payments", rs.getString("app"));
+
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(3.0, rs.getDouble("value"), 0.0001);
+                    Assertions.assertNull(rs.getString("host"));
+                    Assertions.assertEquals("eu-central", rs.getString("region"));
+                    Assertions.assertNull(rs.getString("app"));
+
+                    Assertions.assertFalse(rs.next());
+                }
+            }
+            return null;
+        });
+    }
+
+    @Test
+    public void testHandleMetricsTagsCachingAcrossBatches() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        String metricName = "test_cache_" + System.nanoTime();
+
+        List<List<String>> tags1 = List.of(List.of("host", "srv1"), List.of("env", "prod"));
+        List<List<String>> tags2 = List.of(List.of("host", "srv2"), List.of("env", "prod"));
+        List<List<String>> tags3 = List.of(List.of("host", "srv3"), List.of("env", "stage"));
+
+        // Batch 1: insert with tags1 and tags2
+        MetricData m1 = metric(metricName, 10.0, 1_700_000_001_000_000_000L, tags1);
+        MetricData m2 = metric(metricName, 20.0, 1_700_000_002_000_000_000L, tags2);
+        handler.handleMetrics(List.of(m1, m2));
+
+        // Check tags count in _tags_ table
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT count(*) FROM metrics._tags_" + metricName)) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(2, rs.getInt(1));
+                }
+            }
+            return null;
+        });
+
+        // Batch 2: insert with cached tags1, cached tags2, and new tags3
+        MetricData m3 = metric(metricName, 30.0, 1_700_000_003_000_000_000L, tags1); // cached
+        MetricData m4 = metric(metricName, 40.0, 1_700_000_004_000_000_000L, tags2); // cached
+        MetricData m5 = metric(metricName, 50.0, 1_700_000_005_000_000_000L, tags3); // new
+        handler.handleMetrics(List.of(m3, m4, m5));
+
+        // Verify total metrics rows is 5
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT count(*) FROM metrics." + metricName)) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(5, rs.getInt(1));
+                }
+            }
+            return null;
+        });
+
+        // Verify total tags combinations in _tags_ table is only 3
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT count(*) FROM metrics._tags_" + metricName)) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(3, rs.getInt(1));
+                }
+            }
+            return null;
+        });
+    }
+
+    @Test
+    public void testHandleMetricsDefaultTimestampZero() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        String metricName = "test_ts_zero_" + System.nanoTime();
+        long beforeTime = System.currentTimeMillis();
+
+        MetricData metricData = metric(metricName, 99.9, 0L, List.of(List.of("host", "srv-ts")));
+        handler.handleMetrics(List.of(metricData));
+
+        long afterTime = System.currentTimeMillis();
+
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT created_at, value FROM metrics." + metricName)) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Timestamp createdAt = rs.getTimestamp("created_at");
+                    Assertions.assertNotNull(createdAt);
+                    Assertions.assertTrue(createdAt.getTime() >= beforeTime - 1000);
+                    Assertions.assertTrue(createdAt.getTime() <= afterTime + 1000);
+                    Assertions.assertEquals(99.9, rs.getDouble("value"), 0.0001);
+                }
+            }
+            return null;
+        });
+    }
+
+    @Test
+    public void testHandleMetricsSpecialCharactersAndNormalization() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        // Metric name with dots and dashes
+        String rawMetricName = "My-App.Http.Requests-Count." + System.nanoTime();
+        String expectedTableName = rawMetricName.toLowerCase().replaceAll("\\W+", "_");
+
+        // Tags with reserved word 'id' and hyphenated 'user-agent'
+        MetricData metricData = metric(rawMetricName, 55.0, 1_700_000_000_000_000_000L, List.of(
+                List.of("id", "req-1234"),
+                List.of("user-agent", "Mozilla/5.0")
+        ));
+
+        handler.handleMetrics(List.of(metricData));
+
+        // Verify query on view with normalized column names "_id" and "user_agent"
+        dbService.withDB(c -> {
+            try (PreparedStatement statement = c.prepareStatement("SELECT value, \"_id\", \"user_agent\" FROM " + expectedTableName)) {
+                try (ResultSet rs = statement.executeQuery()) {
+                    Assertions.assertTrue(rs.next());
+                    Assertions.assertEquals(55.0, rs.getDouble("value"), 0.0001);
+                    Assertions.assertEquals("req-1234", rs.getString("_id"));
+                    Assertions.assertEquals("Mozilla/5.0", rs.getString("user_agent"));
+                }
+            }
+            return null;
+        });
+    }
+
+    @Test
+    public void testHandleMetricsEmptyBatch() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = new IngestHandler();
+        handler.dbService = dbService;
+
+        Assertions.assertDoesNotThrow(() -> handler.handleMetrics(Collections.emptyList()));
     }
 }

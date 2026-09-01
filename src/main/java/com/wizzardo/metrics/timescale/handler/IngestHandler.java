@@ -302,6 +302,11 @@ public class IngestHandler extends RestHandler implements PostConstruct {
 //            insert(metric);
 //        }
 
+        handleMetrics(metricData);
+        return response.setStatus(Status._200).body("");
+    }
+
+    protected void handleMetrics(List<MetricData> metricData) {
         {
             HashSet<String> tags = new HashSet<>(metricData.size());
             for (MetricData metric : metricData) {
@@ -356,13 +361,17 @@ public class IngestHandler extends RestHandler implements PostConstruct {
 
             Table tagsTable = tables.value;
             List<Field> fields = tagsTable.getFields();
-            Map<List<List<String>>, Integer> insertedTags = dbService.withBuilder(db -> importTags(db, allTags, fields, tableName, new HashMap<>()));
+            Map<List<List<String>>, Integer> insertedTags = dbService.withBuilder(db -> importTags(db, allTags, fields, tagsTable.getName(), new HashMap<>(allTags.size())));
 
             for (Pair<Metric, MetricData> metric : withoutTags) {
                 createdTags[0]++;
                 notCachedTags[0]++;
 //                metric.key.tagsId = getOrCreateTags(metric.value, tables).id;
-                metric.key.tagsId = insertedTags.get(metric.value.tags);
+                Integer tagsId = insertedTags.get(metric.value.tags);
+                if (tagsId == null) {
+                    throw new IllegalStateException("tags not inserted: " + metric.value.tags);
+                }
+                metric.key.tagsId = tagsId;
             }
 
             return Pair.of(tableName, l.stream().map(p -> p.key).toList());
@@ -397,7 +406,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         long stopPreparing = System.nanoTime();
 
         StringBuilder sb = new StringBuilder(256);
-        sb.append("p ").append(createdTags[0]).append(" ").append(notCachedTags[0]).append(":").append(((int) (stopPreparing - startPreparing) / 1000f) / 1000f).append("ms ");
+        sb.append("p ").append(createdTags[0]).append(" ").append(notCachedTags[0]).append(":").append(((int) ((stopPreparing - startPreparing) / 1000f)) / 1000f).append("ms ");
 
 //        for (Map.Entry<String, List<Metric>> entry : metrics.entrySet()) {
 //            String key = entry.getKey();
@@ -414,21 +423,20 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             long startInserting = System.nanoTime();
             insert(tableName, value);
             long stopInserting = System.nanoTime();
-            sb.append("i ").append(value.size()).append(": ").append(((int) (stopInserting - startInserting) / 1000f) / 1000f).append("ms ");
+            sb.append("i ").append(value.size()).append(": ").append(((int) ((stopInserting - startInserting) / 1000f)) / 1000f).append("ms ");
         }
 
         System.out.println(sb);
-
-        return response.setStatus(Status._200).body("");
     }
 
     void insert(String tableName, List<Metric> metrics) {
         try {
-            metrics.sort(Comparator.comparing(metric -> metric.createdAt));
+            List<Metric> sorted = new ArrayList<>(metrics);
+            sorted.sort(Comparator.comparing(metric -> metric.createdAt));
             dbService.withDB(c -> {
                 PreparedStatement statement = c.prepareStatement("INSERT INTO " + schema + "." + tableName + " (created_at, tags_id, value) VALUES (?, ?, ?)");
-                for (int i = 0; i < metrics.size(); i++) {
-                    Metric metric = metrics.get(i);
+                for (int i = 0; i < sorted.size(); i++) {
+                    Metric metric = sorted.get(i);
                     statement.setTimestamp(1, metric.createdAt);
                     statement.setLong(2, metric.tagsId);
                     statement.setDouble(3, metric.value);
@@ -443,6 +451,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             });
         } catch (Exception e) {
             e.printStackTrace();
+//            throw Unchecked.rethrow(e);
         }
     }
 
@@ -680,14 +689,28 @@ public class IngestHandler extends RestHandler implements PostConstruct {
             return into != null ? into : Collections.emptyMap();
         }
 
-//        String tableName = tagsTable.getName();
-//        String shortTableName = tableName;
-//        if (shortTableName.contains("._tags_")) {
-//            shortTableName = shortTableName.substring(shortTableName.indexOf("._tags_") + 7);
-//        } else if (shortTableName.startsWith("_tags_")) {
-//            shortTableName = shortTableName.substring(6);
-//        }
+        String shortTableName = tableName;
+        if (shortTableName.contains("._tags_")) {
+            shortTableName = shortTableName.substring(shortTableName.indexOf("._tags_") + 7);
+        } else if (shortTableName.startsWith("_tags_")) {
+            shortTableName = shortTableName.substring(6);
+        }
 
+        List<List<List<String>>> distinctTags = new ArrayList<>();
+        Set<List<List<String>>> seen = new HashSet<>();
+
+        for (List<List<String>> tags : tagsList) {
+            if (tags == null)
+                continue;
+
+             if (seen.add(tags)) {
+                distinctTags.add(tags);
+            }
+        }
+
+        if (distinctTags.isEmpty()) {
+            return into;
+        }
 
 
 //        List<Field> tagsColumns = fields.stream()
@@ -722,7 +745,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
 //            return into;
 //        }
 
-        int distinctCount = tagsList.size();
+        int distinctCount = distinctTags.size();
         Integer[] rowIds = new Integer[distinctCount];
         for (int i = 0; i < distinctCount; i++) {
             rowIds[i] = i;
@@ -732,7 +755,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         Integer[][] colArrays = new Integer[colCount][distinctCount];
 
         for (int i = 0; i < distinctCount; i++) {
-            List<List<String>> tags = tagsList.get(i);
+            List<List<String>> tags = distinctTags.get(i);
             for (int j = 0; j < colCount; j++) {
                 Field field = fields.get(j + 1);
                 Integer tagId = null;
@@ -797,6 +820,8 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                 "JOIN input inp ON " + joinInsConditionSql;
 
 //        System.out.println(sql);
+        System.out.println("preparing tag combos: " + distinctTags.size());
+        long start = System.nanoTime();
         Connection connection = db.getConnection();
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setArray(1, connection.createArrayOf("int4", rowIds));
@@ -808,16 +833,19 @@ public class IngestHandler extends RestHandler implements PostConstruct {
                 while (resultSet.next()) {
                     int rowId = resultSet.getInt(1);
                     int id = resultSet.getInt(2);
-                    List<List<String>> tags = tagsList.get(rowId);
+                    List<List<String>> tags = distinctTags.get(rowId);
                     if (into != null)
                         into.put(tags, id);
-//                    tagsCache.put(new TagsCacheKey(shortTableName, tags), id);
+                    tagsCache.put(new TagsCacheKey(shortTableName, tags), id);
                     tagsCache.put(new TagsCacheKey(tableName, tags), id);
                 }
             }
-        } catch (SQLException e) {
+        } catch (Exception e) {
+            e.printStackTrace();
             throw Unchecked.rethrow(e);
         }
+        long stop = System.nanoTime();
+        System.out.println("tag combos prepared in " + ((stop - start) / 1000000) + "ms");
 
         return into;
     }
