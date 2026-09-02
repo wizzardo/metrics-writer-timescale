@@ -5,6 +5,7 @@ import com.wizzardo.http.framework.di.DependencyFactory;
 import com.wizzardo.http.framework.template.Tag;
 import com.wizzardo.metrics.timescale.handler.IngestHandler;
 import com.wizzardo.metrics.timescale.service.DBService;
+import com.wizzardo.metrics.timescale.service.TagsCleanupService;
 
 import java.util.Collections;
 import java.util.List;
@@ -16,6 +17,7 @@ public class App extends WebApplication {
         onSetup(app -> {
             app.setDebugOutput(false);
             DependencyFactory.get(DBService.class); // force migrations
+            DependencyFactory.get(TagsCleanupService.class);
             app.getUrlMapping()
                     .append("/v1/metrics", IngestHandler.class)
             ;

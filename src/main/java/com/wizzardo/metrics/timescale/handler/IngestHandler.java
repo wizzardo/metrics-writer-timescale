@@ -33,7 +33,7 @@ import java.util.stream.Stream;
 
 @Injectable
 public class IngestHandler extends RestHandler implements PostConstruct {
-    DBService dbService;
+    public DBService dbService;
     String schema = "metrics";
 //    String schema = "public";
 
@@ -51,6 +51,11 @@ public class IngestHandler extends RestHandler implements PostConstruct {
     public IngestHandler() {
         super(IngestHandler.class.getSimpleName());
         post(this::handlePost);
+    }
+
+    public IngestHandler(DBService dbService) {
+        this();
+        this.dbService = dbService;
     }
 
     public static class PgTable {
@@ -306,7 +311,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         return response.setStatus(Status._200).body("");
     }
 
-    protected void handleMetrics(List<MetricData> metricData) {
+    public void handleMetrics(List<MetricData> metricData) {
         {
             HashSet<String> tags = new HashSet<>(metricData.size());
             for (MetricData metric : metricData) {
@@ -1154,7 +1159,7 @@ public class IngestHandler extends RestHandler implements PostConstruct {
         return into;
     }
 
-    Integer getTagId(QueryBuilder.WrapConnectionStep db, String value) {
+    public Integer getTagId(QueryBuilder.WrapConnectionStep db, String value) {
         if (value == null) {
             return null;
         }
