@@ -16,6 +16,7 @@ import java.time.LocalTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 public class TagsCleanupServiceTest extends IntegrationTestBase {
 
@@ -72,7 +73,7 @@ public class TagsCleanupServiceTest extends IntegrationTestBase {
         Assertions.assertEquals(25, config.getBatchPauseMs());
         Assertions.assertEquals("metrics", config.getSchema());
         Assertions.assertTrue(config.isEnabled());
-        Assertions.assertEquals("tags_cleanup", config.prefix());
+        Assertions.assertEquals("tagscleanup", config.prefix());
 
         TagsCleanupConfig defaultConfig = new TagsCleanupConfig();
         Assertions.assertEquals(50, defaultConfig.getBatchPauseMs());
@@ -430,5 +431,48 @@ public class TagsCleanupServiceTest extends IntegrationTestBase {
 
         Assertions.assertTrue(summary.rowsDeleted >= 201);
         Assertions.assertTrue(duration >= 250, "Duration should reflect batch pauses, was: " + duration + " ms");
+    }
+
+    @Test
+    public void testGetUsedTagIds() {
+        DBService dbService = DependencyFactory.get(DBService.class);
+        IngestHandler handler = createHandler(dbService);
+
+        String metricName = "cleanup_get_used_m_" + System.nanoTime();
+        String usedHost = "used-host-" + System.nanoTime();
+        String unusedHost = "unused-host-" + System.nanoTime();
+
+        MetricData m1 = metric(metricName, 1.0, 1_700_000_000_000_000_000L, List.of(List.of("host", usedHost), List.of("env", "prod")));
+        MetricData m2 = metric(metricName, 2.0, 1_700_000_000_000_000_000L, List.of(List.of("host", unusedHost), List.of("env", "prod")));
+
+        handler.handleMetrics(List.of(m1, m2));
+
+        int usedHostTagId = dbService.withBuilder(db -> handler.getTagId(db, usedHost));
+        int unusedHostTagId = dbService.withBuilder(db -> handler.getTagId(db, unusedHost));
+
+        // Delete metric data rows for unusedHost
+        dbService.withDB(c -> {
+            try (PreparedStatement st = c.prepareStatement(
+                    "DELETE FROM metrics." + metricName + " WHERE tags_id IN (" +
+                            "SELECT id FROM metrics._tags_" + metricName + " WHERE \"host\" = ?)"
+            )) {
+                st.setInt(1, unusedHostTagId);
+                st.executeUpdate();
+            }
+            return null;
+        });
+
+        TagsCleanupService cleanupService = new TagsCleanupService(dbService, new TagsCleanupConfig("host", "03:00", 1000, "metrics", true));
+
+        dbService.withDB(c -> {
+            List<Integer> distinctTagIds = cleanupService.getDistinctTagIds(c, "metrics", "_tags_" + metricName, "host");
+            Assertions.assertTrue(distinctTagIds.contains(usedHostTagId));
+            Assertions.assertTrue(distinctTagIds.contains(unusedHostTagId));
+
+            Set<Integer> usedTagIds = cleanupService.getUsedTagIds(c, "metrics", "_tags_" + metricName, metricName, "host");
+            Assertions.assertTrue(usedTagIds.contains(usedHostTagId));
+            Assertions.assertFalse(usedTagIds.contains(unusedHostTagId));
+            return null;
+        });
     }
 }

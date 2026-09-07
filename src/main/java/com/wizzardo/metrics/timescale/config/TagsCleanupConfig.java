@@ -13,19 +13,20 @@ import java.util.List;
 
 public class TagsCleanupConfig implements Configuration {
 
-    public String tags = "";
-    public String startTime = "";
-    public int batchSize = 1000;
-    public long batchPauseMs = 50;
-    public String schema = "metrics";
-    public boolean enabled = true;
+    public final String tags;
+    public final String startTime;
+    public final int batchSize;
+    public final long batchPauseMs;
+    public final String schema;
+    public final boolean enabled;
 
     @Override
     public String prefix() {
-        return "tags_cleanup";
+        return "tagscleanup";
     }
 
     public TagsCleanupConfig() {
+        this(null, null, 0, null, false);
     }
 
     public TagsCleanupConfig(String tags, String startTime, int batchSize, String schema, boolean enabled) {
@@ -42,7 +43,8 @@ public class TagsCleanupConfig implements Configuration {
     }
 
     public List<String> getTags() {
-        String effectiveTags = (tags != null && !tags.trim().isEmpty()) ? tags : System.getenv("TAGS_CLEANUP_TAGS");
+//        String effectiveTags = (tags != null && !tags.trim().isEmpty()) ? tags : System.getenv("TAGS_CLEANUP_TAGS");
+        String effectiveTags = tags;
         if (effectiveTags == null || effectiveTags.trim().isEmpty()) {
             return Collections.emptyList();
         }
@@ -73,8 +75,9 @@ public class TagsCleanupConfig implements Configuration {
         if (startTime != null && !startTime.trim().isEmpty()) {
             return startTime.trim();
         }
-        String env = System.getenv("TAGS_CLEANUP_START_TIME");
-        return env != null ? env.trim() : "";
+        return null;
+//        String env = System.getenv("TAGS_CLEANUP_START_TIME");
+//        return env != null ? env.trim() : "";
     }
 
     public LocalTime getParsedStartTime() {
@@ -86,16 +89,16 @@ public class TagsCleanupConfig implements Configuration {
     }
 
     public int getBatchSize() {
-        if (batchSize > 0 && batchSize != 1000) {
-            return batchSize;
-        }
-        String env = System.getenv("TAGS_CLEANUP_BATCH_SIZE");
-        if (env != null && !env.trim().isEmpty()) {
-            try {
-                return Integer.parseInt(env.trim());
-            } catch (NumberFormatException ignored) {
-            }
-        }
+//        if (batchSize > 0 && batchSize != 1000) {
+//            return batchSize;
+//        }
+//        String env = System.getenv("TAGS_CLEANUP_BATCH_SIZE");
+//        if (env != null && !env.trim().isEmpty()) {
+//            try {
+//                return Integer.parseInt(env.trim());
+//            } catch (NumberFormatException ignored) {
+//            }
+//        }
         return batchSize > 0 ? batchSize : 1000;
     }
 
@@ -103,16 +106,16 @@ public class TagsCleanupConfig implements Configuration {
         if (batchPauseMs >= 0 && batchPauseMs != 50) {
             return batchPauseMs;
         }
-        String env = System.getenv("TAGS_CLEANUP_BATCH_PAUSE_MS");
-        if (env == null || env.trim().isEmpty()) {
-            env = System.getenv("TAGS_CLEANUP_PAUSE_BETWEEN_BATCHES_MS");
-        }
-        if (env != null && !env.trim().isEmpty()) {
-            try {
-                return Long.parseLong(env.trim());
-            } catch (NumberFormatException ignored) {
-            }
-        }
+//        String env = System.getenv("TAGS_CLEANUP_BATCH_PAUSE_MS");
+//        if (env == null || env.trim().isEmpty()) {
+//            env = System.getenv("TAGS_CLEANUP_PAUSE_BETWEEN_BATCHES_MS");
+//        }
+//        if (env != null && !env.trim().isEmpty()) {
+//            try {
+//                return Long.parseLong(env.trim());
+//            } catch (NumberFormatException ignored) {
+//            }
+//        }
         return batchPauseMs >= 0 ? batchPauseMs : 50;
     }
 
@@ -120,18 +123,18 @@ public class TagsCleanupConfig implements Configuration {
         if (schema != null && !schema.trim().isEmpty() && !schema.equals("metrics")) {
             return schema.trim();
         }
-        String env = System.getenv("TAGS_CLEANUP_SCHEMA");
-        if (env != null && !env.trim().isEmpty()) {
-            return env.trim();
-        }
+//        String env = System.getenv("TAGS_CLEANUP_SCHEMA");
+//        if (env != null && !env.trim().isEmpty()) {
+//            return env.trim();
+//        }
         return schema != null && !schema.trim().isEmpty() ? schema.trim() : "metrics";
     }
 
     public boolean isEnabled() {
-        String env = System.getenv("TAGS_CLEANUP_ENABLED");
-        if (env != null && !env.trim().isEmpty()) {
-            return Boolean.parseBoolean(env.trim());
-        }
+//        String env = System.getenv("TAGS_CLEANUP_ENABLED");
+//        if (env != null && !env.trim().isEmpty()) {
+//            return Boolean.parseBoolean(env.trim());
+//        }
         return enabled;
     }
 

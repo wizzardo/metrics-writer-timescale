@@ -17,3 +17,12 @@ datasource {
     username = 'metrics-rw'
     password = 'qwerty'
 }
+
+tagscleanup {
+    batchSize = 1000
+    batchPauseMs = 50
+    schema = 'metrics'
+    tags = ''
+    startTime = ''
+    enabled = false
+}

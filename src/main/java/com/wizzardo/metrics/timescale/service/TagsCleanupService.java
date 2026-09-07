@@ -5,11 +5,13 @@ import com.wizzardo.http.framework.di.Injectable;
 import com.wizzardo.http.framework.di.PostConstruct;
 import com.wizzardo.http.framework.di.Service;
 import com.wizzardo.metrics.timescale.config.TagsCleanupConfig;
+import com.wizzardo.tools.json.JsonTools;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -66,6 +68,8 @@ public class TagsCleanupService implements Service, PostConstruct {
             } catch (Exception ignored) {
             }
         }
+
+        System.out.println("TagsCleanupService.config: " + JsonTools.serialize(config));
         if (!config.isEnabled()) {
             System.out.println("TagsCleanupService: service is disabled");
             return;
@@ -154,25 +158,37 @@ public class TagsCleanupService implements Service, PostConstruct {
 
         try {
             dbService.withDB(c -> {
-                List<String> tagsTables = getMetricTagsTables(c, schema);
-                for (String tagsTable : tagsTables) {
-                    summary.tablesScanned++;
-                    String metricTable = tagsTable.substring("_tags_".length());
-                    System.out.println("TagsCleanupService: cleaning table " + tagsTable);
-                    long tableStart = System.currentTimeMillis();
-                    int rowsDeletedBefore = summary.rowsDeleted;
+                String previousTimeout = getStatementTimeout(c);
+                try {
+                    setStatementTimeout(c, "10min");
+                    List<String> tagsTables = getMetricTagsTables(c, schema);
+                    for (String tagsTable : tagsTables) {
+                        summary.tablesScanned++;
+                        String metricTable = tagsTable.substring("_tags_".length());
+                        System.out.println("TagsCleanupService: cleaning table " + tagsTable);
+                        long tableStart = System.currentTimeMillis();
+                        int rowsDeletedBefore = summary.rowsDeleted;
 
-                    Set<String> columns = getTableColumns(c, schema, tagsTable);
-                    for (String tag : tags) {
-                        String tagColumn = TagsCleanupConfig.toColumnName(tag);
-                        if (columns.contains(tagColumn)) {
-                            cleanupTableTag(c, schema, tagsTable, metricTable, tagColumn, batchSize, batchPauseMs, summary);
+                        Set<String> columns = getTableColumns(c, schema, tagsTable);
+                        for (String tag : tags) {
+                            String tagColumn = TagsCleanupConfig.toColumnName(tag);
+                            if (columns.contains(tagColumn)) {
+                                cleanupTableTag(c, schema, tagsTable, metricTable, tagColumn, batchSize, batchPauseMs, summary);
+                            }
+                        }
+
+                        long tableDuration = System.currentTimeMillis() - tableStart;
+                        int tableRowsDeleted = summary.rowsDeleted - rowsDeletedBefore;
+                        System.out.println("TagsCleanupService: finished cleaning table " + tagsTable + " in " + tableDuration + " ms (deleted " + tableRowsDeleted + " rows)");
+                    }
+                } finally {
+                    if (previousTimeout != null) {
+                        try {
+                            setStatementTimeout(c, previousTimeout);
+                        } catch (Exception e) {
+                            System.err.println("TagsCleanupService: failed to restore statement_timeout: " + e.getMessage());
                         }
                     }
-
-                    long tableDuration = System.currentTimeMillis() - tableStart;
-                    int tableRowsDeleted = summary.rowsDeleted - rowsDeletedBefore;
-                    System.out.println("TagsCleanupService: finished cleaning table " + tagsTable + " in " + tableDuration + " ms (deleted " + tableRowsDeleted + " rows)");
                 }
                 return null;
             });
@@ -185,6 +201,22 @@ public class TagsCleanupService implements Service, PostConstruct {
         }
 
         return summary;
+    }
+
+    public String getStatementTimeout(Connection c) throws SQLException {
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SHOW statement_timeout")) {
+            if (rs.next()) {
+                return rs.getString(1);
+            }
+        }
+        return null;
+    }
+
+    public void setStatementTimeout(Connection c, String timeout) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            st.execute("SET statement_timeout = '" + timeout + "'");
+        }
     }
 
     public List<String> getMetricTagsTables(Connection c, String schema) throws SQLException {
@@ -236,6 +268,20 @@ public class TagsCleanupService implements Service, PostConstruct {
         return tagIds;
     }
 
+    public Set<Integer> getUsedTagIds(Connection c, String schema, String tagsTableName, String metricTableName, String tagColumn) throws SQLException {
+        Set<Integer> tagIds = new HashSet<>();
+        String sql = "SELECT DISTINCT tag.id FROM \"" + schema + "\".\"" + tagsTableName + "\" c " +
+                "JOIN \"" + schema + "\".\"_tag\" tag ON c.\"" + tagColumn + "\" = tag.id " +
+                "JOIN \"" + schema + "\".\"" + metricTableName + "\" cp ON cp.tags_id = c.id";
+        try (PreparedStatement st = c.prepareStatement(sql);
+             ResultSet rs = st.executeQuery()) {
+            while (rs.next()) {
+                tagIds.add(rs.getInt(1));
+            }
+        }
+        return tagIds;
+    }
+
     public boolean isTagReferenced(Connection c, String schema, String tagsTableName, String metricTableName, String tagColumn, int tagId) throws SQLException {
         String sql = "SELECT 1 FROM \"" + schema + "\".\"" + metricTableName + "\" WHERE tags_id IN (" +
                 "SELECT id FROM \"" + schema + "\".\"" + tagsTableName + "\" WHERE \"" + tagColumn + "\" = ?" +
@@ -270,10 +316,14 @@ public class TagsCleanupService implements Service, PostConstruct {
 
     public void cleanupTableTag(Connection c, String schema, String tagsTableName, String metricTableName, String tagColumn, int batchSize, long batchPauseMs, TagsCleanupSummary summary) throws SQLException {
         List<Integer> tagIds = getDistinctTagIds(c, schema, tagsTableName, tagColumn);
+        if (tagIds.isEmpty()) {
+            return;
+        }
+
+        Set<Integer> usedTagIds = getUsedTagIds(c, schema, tagsTableName, metricTableName, tagColumn);
         for (int tagId : tagIds) {
             summary.tagValuesChecked++;
-            boolean referenced = isTagReferenced(c, schema, tagsTableName, metricTableName, tagColumn, tagId);
-            if (!referenced) {
+            if (!usedTagIds.contains(tagId)) {
                 int deleted;
                 do {
                     deleted = deleteBatch(c, schema, tagsTableName, tagColumn, tagId, batchSize);
